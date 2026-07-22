@@ -124,7 +124,7 @@ constructor:
     for program in [&program_0, &program_1, &main_program] {
         println!("Deploying program: {}", program.id());
         let deployment = vm.deploy(&caller_private_key, program, None, 0, None, rng).unwrap();
-        add_and_test(&vm, &caller_private_key, &[deployment], rng);
+        add_and_test_with_costs(&vm, &caller_private_key, None, &[deployment], rng);
     }
 
     // Create a helper to execute the `test_dynamic_contains` function.
@@ -189,18 +189,11 @@ constructor:
     test_dynamic_contains("main_program", "aleo", "data_main", Value::from_str("42u32").unwrap(), Some(false), rng);
 
     // Set the key 42 in the local mapping.
+    let set_inputs = vec![Value::from_str("42u32").unwrap(), Value::from_str("100u32").unwrap()];
     let set_tx = vm
-        .execute(
-            &caller_private_key,
-            ("main_program.aleo", "set_mapping"),
-            vec![Value::from_str("42u32").unwrap(), Value::from_str("100u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("main_program.aleo", "set_mapping"), set_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Check that the local mapping now contains the key 42.
     test_dynamic_contains("main_program", "aleo", "data_main", Value::from_str("42u32").unwrap(), Some(true), rng);
@@ -215,49 +208,28 @@ constructor:
     test_dynamic_contains("main_program", "aleo", "data_main", Value::from_str("true").unwrap(), None, rng);
 
     // Remove the key 42 from the local mapping.
+    let remove_inputs = vec![Value::from_str("42u32").unwrap()];
     let remove_tx = vm
-        .execute(
-            &caller_private_key,
-            ("main_program.aleo", "remove_mapping"),
-            vec![Value::from_str("42u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("main_program.aleo", "remove_mapping"), remove_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
     // Check that the local mapping no longer contains the key 42.
     test_dynamic_contains("main_program", "aleo", "data_main", Value::from_str("42u32").unwrap(), Some(false), rng);
 
     // Set the key 7 in the first external program's mapping.
+    let set_inputs = vec![Value::from_str("7u32").unwrap(), Value::from_str("200u32").unwrap()];
     let set_tx = vm
-        .execute(
-            &caller_private_key,
-            ("basic_program0.aleo", "set_mapping"),
-            vec![Value::from_str("7u32").unwrap(), Value::from_str("200u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("basic_program0.aleo", "set_mapping"), set_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Set the key 15 in the second external program's mapping.
+    let set_inputs = vec![Value::from_str("15u32").unwrap(), Value::from_str("300u32").unwrap()];
     let set_tx = vm
-        .execute(
-            &caller_private_key,
-            ("basic_program1.aleo", "set_mapping"),
-            vec![Value::from_str("15u32").unwrap(), Value::from_str("300u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("basic_program1.aleo", "set_mapping"), set_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Check that the first external mapping contains the key 7.
     test_dynamic_contains("basic_program0", "aleo", "data0", Value::from_str("7u32").unwrap(), Some(true), rng);
@@ -265,32 +237,34 @@ constructor:
     test_dynamic_contains("basic_program1", "aleo", "data1", Value::from_str("15u32").unwrap(), Some(true), rng);
 
     // Remove the key 7 from the first external program's mapping.
+    let remove_inputs = vec![Value::from_str("7u32").unwrap()];
     let remove_tx = vm
         .execute(
             &caller_private_key,
             ("basic_program0.aleo", "remove_mapping"),
-            vec![Value::from_str("7u32").unwrap()].iter(),
+            remove_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
     // Remove the key 15 from the second external program's mapping.
+    let remove_inputs = vec![Value::from_str("15u32").unwrap()];
     let remove_tx = vm
         .execute(
             &caller_private_key,
             ("basic_program1.aleo", "remove_mapping"),
-            vec![Value::from_str("15u32").unwrap()].iter(),
+            remove_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
     // Check that the first external mapping no longer contains the key 7.
     test_dynamic_contains("basic_program0", "aleo", "data0", Value::from_str("7u32").unwrap(), Some(false), rng);
@@ -486,7 +460,7 @@ constructor:
     for program in [&program_0, &program_1, &struct_program_0, &main_program] {
         println!("Deploying program: {}", program.id());
         let deployment = vm.deploy(&caller_private_key, program, None, 0, None, rng).unwrap();
-        add_and_test(&vm, &caller_private_key, &[deployment], rng);
+        add_and_test_with_costs(&vm, &caller_private_key, None, &[deployment], rng);
     }
 
     // Create a helper to execute the `test_dynamic_get_u32` function.
@@ -669,18 +643,11 @@ constructor:
     test_dynamic_get_u32(&vm, "main_program", "aleo", "data_main", 42, None, rng);
 
     // Set the key 42 in the local mapping.
+    let set_inputs = vec![Value::from_str("42u32").unwrap(), Value::from_str("100u32").unwrap()];
     let set_tx = vm
-        .execute(
-            &caller_private_key,
-            ("main_program.aleo", "set_mapping"),
-            vec![Value::from_str("42u32").unwrap(), Value::from_str("100u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("main_program.aleo", "set_mapping"), set_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Check that get.dynamic returns the correct value for the local mapping.
     test_dynamic_get_u32(&vm, "main_program", "aleo", "data_main", 42, Some(100), rng);
@@ -696,49 +663,28 @@ constructor:
     test_dynamic_get_wrong_type(&vm, "main_program", "aleo", "data_main", 42, rng);
 
     // Remove the key 42 from the local mapping.
+    let remove_inputs = vec![Value::from_str("42u32").unwrap()];
     let remove_tx = vm
-        .execute(
-            &caller_private_key,
-            ("main_program.aleo", "remove_mapping"),
-            vec![Value::from_str("42u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("main_program.aleo", "remove_mapping"), remove_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
     // Check that get.dynamic fails after removal.
     test_dynamic_get_u32(&vm, "main_program", "aleo", "data_main", 42, None, rng);
 
     // Set the key 7 in the first external program's mapping.
+    let set_inputs = vec![Value::from_str("7u32").unwrap(), Value::from_str("200u32").unwrap()];
     let set_tx = vm
-        .execute(
-            &caller_private_key,
-            ("basic_program0.aleo", "set_mapping"),
-            vec![Value::from_str("7u32").unwrap(), Value::from_str("200u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("basic_program0.aleo", "set_mapping"), set_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Set the key 15 in the second external program's mapping.
+    let set_inputs = vec![Value::from_str("15u32").unwrap(), Value::from_str("300u32").unwrap()];
     let set_tx = vm
-        .execute(
-            &caller_private_key,
-            ("basic_program1.aleo", "set_mapping"),
-            vec![Value::from_str("15u32").unwrap(), Value::from_str("300u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("basic_program1.aleo", "set_mapping"), set_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Check that get.dynamic returns correct values from external programs.
     test_dynamic_get_u32(&vm, "basic_program0", "aleo", "data0", 7, Some(200), rng);
@@ -749,76 +695,64 @@ constructor:
     test_dynamic_get_u32(&vm, "basic_program1", "aleo", "data1", 99, None, rng);
 
     // Remove the keys from external programs.
+    let remove_inputs = vec![Value::from_str("7u32").unwrap()];
     let remove_tx = vm
         .execute(
             &caller_private_key,
             ("basic_program0.aleo", "remove_mapping"),
-            vec![Value::from_str("7u32").unwrap()].iter(),
+            remove_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
+    let remove_inputs = vec![Value::from_str("15u32").unwrap()];
     let remove_tx = vm
         .execute(
             &caller_private_key,
             ("basic_program1.aleo", "remove_mapping"),
-            vec![Value::from_str("15u32").unwrap()].iter(),
+            remove_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
     // Check that get.dynamic fails after removal from external programs.
     test_dynamic_get_u32(&vm, "basic_program0", "aleo", "data0", 7, None, rng);
     test_dynamic_get_u32(&vm, "basic_program1", "aleo", "data1", 15, None, rng);
 
     // Set a struct value in the local struct mapping.
+    let set_inputs =
+        vec![Value::from_str("10u32").unwrap(), Value::from_str("111u32").unwrap(), Value::from_str("222u64").unwrap()];
     let set_tx = vm
         .execute(
             &caller_private_key,
             ("main_program.aleo", "set_struct_mapping"),
-            vec![
-                Value::from_str("10u32").unwrap(),
-                Value::from_str("111u32").unwrap(),
-                Value::from_str("222u64").unwrap(),
-            ]
-            .iter(),
+            set_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Check that get.dynamic returns the correct struct value from the local mapping.
     test_dynamic_get_struct(&vm, "main_program", "aleo", "struct_data_main", 10, Some((111, 222)), rng);
 
     // Set a struct value in the external struct program's mapping.
+    let set_inputs =
+        vec![Value::from_str("20u32").unwrap(), Value::from_str("333u32").unwrap(), Value::from_str("444u64").unwrap()];
     let set_tx = vm
-        .execute(
-            &caller_private_key,
-            ("struct_program0.aleo", "set_mapping"),
-            vec![
-                Value::from_str("20u32").unwrap(),
-                Value::from_str("333u32").unwrap(),
-                Value::from_str("444u64").unwrap(),
-            ]
-            .iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("struct_program0.aleo", "set_mapping"), set_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Check that get.dynamic returns the correct struct value from the external mapping.
     test_dynamic_get_struct(&vm, "struct_program0", "aleo", "struct_data0", 20, Some((333, 444)), rng);
@@ -828,31 +762,33 @@ constructor:
     test_dynamic_get_struct(&vm, "struct_program0", "aleo", "struct_data0", 99, None, rng);
 
     // Remove struct values.
+    let remove_inputs = vec![Value::from_str("10u32").unwrap()];
     let remove_tx = vm
         .execute(
             &caller_private_key,
             ("main_program.aleo", "remove_struct_mapping"),
-            vec![Value::from_str("10u32").unwrap()].iter(),
+            remove_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
+    let remove_inputs = vec![Value::from_str("20u32").unwrap()];
     let remove_tx = vm
         .execute(
             &caller_private_key,
             ("struct_program0.aleo", "remove_mapping"),
-            vec![Value::from_str("20u32").unwrap()].iter(),
+            remove_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
     // Check that get.dynamic fails after struct removal.
     test_dynamic_get_struct(&vm, "main_program", "aleo", "struct_data_main", 10, None, rng);
@@ -998,7 +934,7 @@ constructor:
     for program in [&program_0, &program_1, &struct_program_0, &main_program] {
         println!("Deploying program: {}", program.id());
         let deployment = vm.deploy(&caller_private_key, program, None, 0, None, rng).unwrap();
-        add_and_test(&vm, &caller_private_key, &[deployment], rng);
+        add_and_test_with_costs(&vm, &caller_private_key, None, &[deployment], rng);
     }
 
     // Create a helper to execute the `test_dynamic_get_or_use_u32` function.
@@ -1130,18 +1066,11 @@ constructor:
     test_dynamic_get_or_use_u32(&vm, "main_program", "aleo", "data_main", 42, 999, Some(999), rng);
 
     // Set the key 42 in the local mapping.
+    let set_inputs = vec![Value::from_str("42u32").unwrap(), Value::from_str("100u32").unwrap()];
     let set_tx = vm
-        .execute(
-            &caller_private_key,
-            ("main_program.aleo", "set_mapping"),
-            vec![Value::from_str("42u32").unwrap(), Value::from_str("100u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("main_program.aleo", "set_mapping"), set_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Check that get.or_use.dynamic returns the stored value (not the default) when key exists.
     test_dynamic_get_or_use_u32(&vm, "main_program", "aleo", "data_main", 42, 999, Some(100), rng);
@@ -1157,18 +1086,11 @@ constructor:
     // so it cannot be tested as a runtime failure like get.dynamic.
 
     // Remove the key 42 from the local mapping.
+    let remove_inputs = vec![Value::from_str("42u32").unwrap()];
     let remove_tx = vm
-        .execute(
-            &caller_private_key,
-            ("main_program.aleo", "remove_mapping"),
-            vec![Value::from_str("42u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("main_program.aleo", "remove_mapping"), remove_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
     // Check that get.or_use.dynamic returns default after removal.
     test_dynamic_get_or_use_u32(&vm, "main_program", "aleo", "data_main", 42, 888, Some(888), rng);
@@ -1178,32 +1100,18 @@ constructor:
     test_dynamic_get_or_use_u32(&vm, "basic_program1", "aleo", "data1", 15, 600, Some(600), rng);
 
     // Set the key 7 in the first external program's mapping.
+    let set_inputs = vec![Value::from_str("7u32").unwrap(), Value::from_str("200u32").unwrap()];
     let set_tx = vm
-        .execute(
-            &caller_private_key,
-            ("basic_program0.aleo", "set_mapping"),
-            vec![Value::from_str("7u32").unwrap(), Value::from_str("200u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("basic_program0.aleo", "set_mapping"), set_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Set the key 15 in the second external program's mapping.
+    let set_inputs = vec![Value::from_str("15u32").unwrap(), Value::from_str("300u32").unwrap()];
     let set_tx = vm
-        .execute(
-            &caller_private_key,
-            ("basic_program1.aleo", "set_mapping"),
-            vec![Value::from_str("15u32").unwrap(), Value::from_str("300u32").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("basic_program1.aleo", "set_mapping"), set_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Check that get.or_use.dynamic returns stored values from external programs.
     test_dynamic_get_or_use_u32(&vm, "basic_program0", "aleo", "data0", 7, 500, Some(200), rng);
@@ -1214,31 +1122,33 @@ constructor:
     test_dynamic_get_or_use_u32(&vm, "basic_program1", "aleo", "data1", 99, 888, Some(888), rng);
 
     // Remove the keys from external programs.
+    let remove_inputs = vec![Value::from_str("7u32").unwrap()];
     let remove_tx = vm
         .execute(
             &caller_private_key,
             ("basic_program0.aleo", "remove_mapping"),
-            vec![Value::from_str("7u32").unwrap()].iter(),
+            remove_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
+    let remove_inputs = vec![Value::from_str("15u32").unwrap()];
     let remove_tx = vm
         .execute(
             &caller_private_key,
             ("basic_program1.aleo", "remove_mapping"),
-            vec![Value::from_str("15u32").unwrap()].iter(),
+            remove_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
     // Check that get.or_use.dynamic returns default after removal from external programs.
     test_dynamic_get_or_use_u32(&vm, "basic_program0", "aleo", "data0", 7, 111, Some(111), rng);
@@ -1248,23 +1158,20 @@ constructor:
     test_dynamic_get_or_use_struct(&vm, "main_program", "aleo", "struct_data_main", 10, (50, 60), Some((50, 60)), rng);
 
     // Set a struct value in the local struct mapping.
+    let set_inputs =
+        vec![Value::from_str("10u32").unwrap(), Value::from_str("111u32").unwrap(), Value::from_str("222u64").unwrap()];
     let set_tx = vm
         .execute(
             &caller_private_key,
             ("main_program.aleo", "set_struct_mapping"),
-            vec![
-                Value::from_str("10u32").unwrap(),
-                Value::from_str("111u32").unwrap(),
-                Value::from_str("222u64").unwrap(),
-            ]
-            .iter(),
+            set_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Check that get.or_use.dynamic returns the stored struct value (not default).
     test_dynamic_get_or_use_struct(
@@ -1282,23 +1189,12 @@ constructor:
     test_dynamic_get_or_use_struct(&vm, "struct_program0", "aleo", "struct_data0", 20, (70, 80), Some((70, 80)), rng);
 
     // Set a struct value in the external struct program's mapping.
+    let set_inputs =
+        vec![Value::from_str("20u32").unwrap(), Value::from_str("333u32").unwrap(), Value::from_str("444u64").unwrap()];
     let set_tx = vm
-        .execute(
-            &caller_private_key,
-            ("struct_program0.aleo", "set_mapping"),
-            vec![
-                Value::from_str("20u32").unwrap(),
-                Value::from_str("333u32").unwrap(),
-                Value::from_str("444u64").unwrap(),
-            ]
-            .iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("struct_program0.aleo", "set_mapping"), set_inputs.iter(), None, 0, None, rng)
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Check that get.or_use.dynamic returns the stored struct value from external mapping.
     test_dynamic_get_or_use_struct(&vm, "struct_program0", "aleo", "struct_data0", 20, (70, 80), Some((333, 444)), rng);
@@ -1308,31 +1204,33 @@ constructor:
     test_dynamic_get_or_use_struct(&vm, "struct_program0", "aleo", "struct_data0", 99, (3, 4), Some((3, 4)), rng);
 
     // Remove struct values.
+    let remove_inputs = vec![Value::from_str("10u32").unwrap()];
     let remove_tx = vm
         .execute(
             &caller_private_key,
             ("main_program.aleo", "remove_struct_mapping"),
-            vec![Value::from_str("10u32").unwrap()].iter(),
+            remove_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
+    let remove_inputs = vec![Value::from_str("20u32").unwrap()];
     let remove_tx = vm
         .execute(
             &caller_private_key,
             ("struct_program0.aleo", "remove_mapping"),
-            vec![Value::from_str("20u32").unwrap()].iter(),
+            remove_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
     // Check that get.or_use.dynamic returns default after struct removal.
     test_dynamic_get_or_use_struct(&vm, "main_program", "aleo", "struct_data_main", 10, (5, 6), Some((5, 6)), rng);
@@ -1400,7 +1298,7 @@ fn test_get_dynamic_empty_mapping() {
     // Deploy the program
     println!("Deploying empty_mapping.aleo...");
     let deployment = vm.deploy(&caller_private_key, &empty_mapping_program, None, 0, None, rng).unwrap();
-    add_and_test(&vm, &caller_private_key, &[deployment], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, None, &[deployment], rng);
 
     // Create field values for the program, network, and mapping names
     let program_name_field =
@@ -1411,17 +1309,17 @@ fn test_get_dynamic_empty_mapping() {
 
     // First verify that contains.dynamic returns false for any key in the empty mapping
     println!("Testing contains.dynamic on empty mapping...");
+    let contains_inputs = vec![
+        Value::from_str(&program_name_field).unwrap(),
+        Value::from_str(&network_field).unwrap(),
+        Value::from_str(&mapping_name_field).unwrap(),
+        Value::from_str("42u32").unwrap(),
+    ];
     let contains_tx = vm
         .execute(
             &caller_private_key,
             ("empty_mapping.aleo", "test_contains_empty"),
-            vec![
-                Value::from_str(&program_name_field).unwrap(),
-                Value::from_str(&network_field).unwrap(),
-                Value::from_str(&mapping_name_field).unwrap(),
-                Value::from_str("42u32").unwrap(),
-            ]
-            .into_iter(),
+            contains_inputs.iter(),
             None,
             0,
             None,
@@ -1430,7 +1328,7 @@ fn test_get_dynamic_empty_mapping() {
         .unwrap();
 
     // contains.dynamic should succeed and return false
-    add_and_test(&vm, &caller_private_key, &[contains_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&contains_inputs]), &[contains_tx], rng);
 
     // Now test that get.dynamic fails on the empty mapping
     println!("Testing get.dynamic on empty mapping (should fail)...");
@@ -1544,7 +1442,7 @@ fn test_contains_dynamic_with_array_keys() {
     // Deploy the program
     println!("Deploying array_key_mapping.aleo...");
     let deployment = vm.deploy(&caller_private_key, &array_key_program, None, 0, None, rng).unwrap();
-    add_and_test(&vm, &caller_private_key, &[deployment], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, None, &[deployment], rng);
 
     // Create field values for dynamic operations
     let program_name_field =
@@ -1555,143 +1453,145 @@ fn test_contains_dynamic_with_array_keys() {
 
     // Test that contains.dynamic returns false for non-existent array key
     println!("Testing contains.dynamic with array key (should be false)...");
+    let contains_inputs = vec![
+        Value::from_str(&program_name_field).unwrap(),
+        Value::from_str(&network_field).unwrap(),
+        Value::from_str(&mapping_name_field).unwrap(),
+        Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap(),
+        Value::from_str("false").unwrap(),
+    ];
     let contains_tx = vm
         .execute(
             &caller_private_key,
             ("array_key_mapping.aleo", "test_contains_array"),
-            vec![
-                Value::from_str(&program_name_field).unwrap(),
-                Value::from_str(&network_field).unwrap(),
-                Value::from_str(&mapping_name_field).unwrap(),
-                Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap(),
-                Value::from_str("false").unwrap(),
-            ]
-            .into_iter(),
+            contains_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[contains_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&contains_inputs]), &[contains_tx], rng);
 
     // Set a value with an array key
     println!("Setting value with array key...");
+    let set_inputs = vec![Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap(), Value::from_str("12345u64").unwrap()];
     let set_tx = vm
         .execute(
             &caller_private_key,
             ("array_key_mapping.aleo", "set_array_mapping"),
-            vec![Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap(), Value::from_str("12345u64").unwrap()].into_iter(),
+            set_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[set_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&set_inputs]), &[set_tx], rng);
 
     // Test that contains.dynamic returns true for existing array key
     println!("Testing contains.dynamic with array key (should be true)...");
+    let contains_inputs = vec![
+        Value::from_str(&program_name_field).unwrap(),
+        Value::from_str(&network_field).unwrap(),
+        Value::from_str(&mapping_name_field).unwrap(),
+        Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap(),
+        Value::from_str("true").unwrap(),
+    ];
     let contains_tx2 = vm
         .execute(
             &caller_private_key,
             ("array_key_mapping.aleo", "test_contains_array"),
-            vec![
-                Value::from_str(&program_name_field).unwrap(),
-                Value::from_str(&network_field).unwrap(),
-                Value::from_str(&mapping_name_field).unwrap(),
-                Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap(),
-                Value::from_str("true").unwrap(),
-            ]
-            .into_iter(),
+            contains_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[contains_tx2], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&contains_inputs]), &[contains_tx2], rng);
 
     // Test that get.dynamic returns the correct value for the array key
     println!("Testing get.dynamic with array key...");
+    let get_inputs = vec![
+        Value::from_str(&program_name_field).unwrap(),
+        Value::from_str(&network_field).unwrap(),
+        Value::from_str(&mapping_name_field).unwrap(),
+        Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap(),
+        Value::from_str("12345u64").unwrap(),
+    ];
     let get_tx = vm
         .execute(
             &caller_private_key,
             ("array_key_mapping.aleo", "test_get_array"),
-            vec![
-                Value::from_str(&program_name_field).unwrap(),
-                Value::from_str(&network_field).unwrap(),
-                Value::from_str(&mapping_name_field).unwrap(),
-                Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap(),
-                Value::from_str("12345u64").unwrap(),
-            ]
-            .into_iter(),
+            get_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[get_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&get_inputs]), &[get_tx], rng);
 
     // Test that a different array key still returns false
     println!("Testing contains.dynamic with different array key (should be false)...");
+    let contains_inputs = vec![
+        Value::from_str(&program_name_field).unwrap(),
+        Value::from_str(&network_field).unwrap(),
+        Value::from_str(&mapping_name_field).unwrap(),
+        Value::from_str("[5u8, 6u8, 7u8, 8u8]").unwrap(), // Different key
+        Value::from_str("false").unwrap(),
+    ];
     let contains_tx3 = vm
         .execute(
             &caller_private_key,
             ("array_key_mapping.aleo", "test_contains_array"),
-            vec![
-                Value::from_str(&program_name_field).unwrap(),
-                Value::from_str(&network_field).unwrap(),
-                Value::from_str(&mapping_name_field).unwrap(),
-                Value::from_str("[5u8, 6u8, 7u8, 8u8]").unwrap(), // Different key
-                Value::from_str("false").unwrap(),
-            ]
-            .into_iter(),
+            contains_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[contains_tx3], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&contains_inputs]), &[contains_tx3], rng);
 
     // Remove the array key and verify contains returns false again
     println!("Removing array key...");
+    let remove_inputs = vec![Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap()];
     let remove_tx = vm
         .execute(
             &caller_private_key,
             ("array_key_mapping.aleo", "remove_array_mapping"),
-            vec![Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap()].into_iter(),
+            remove_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[remove_tx], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&remove_inputs]), &[remove_tx], rng);
 
     // Verify contains returns false after removal
     println!("Testing contains.dynamic after removal (should be false)...");
+    let contains_inputs = vec![
+        Value::from_str(&program_name_field).unwrap(),
+        Value::from_str(&network_field).unwrap(),
+        Value::from_str(&mapping_name_field).unwrap(),
+        Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap(),
+        Value::from_str("false").unwrap(),
+    ];
     let contains_tx4 = vm
         .execute(
             &caller_private_key,
             ("array_key_mapping.aleo", "test_contains_array"),
-            vec![
-                Value::from_str(&program_name_field).unwrap(),
-                Value::from_str(&network_field).unwrap(),
-                Value::from_str(&mapping_name_field).unwrap(),
-                Value::from_str("[1u8, 2u8, 3u8, 4u8]").unwrap(),
-                Value::from_str("false").unwrap(),
-            ]
-            .into_iter(),
+            contains_inputs.iter(),
             None,
             0,
             None,
             rng,
         )
         .unwrap();
-    add_and_test(&vm, &caller_private_key, &[contains_tx4], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&contains_inputs]), &[contains_tx4], rng);
 }
 
 // This test verifies that `get.dynamic` properly rejects invalid program IDs at finalize time:
@@ -1745,7 +1645,7 @@ constructor:
     for program in [&program_0, &main_program] {
         println!("Deploying program: {}", program.id());
         let deployment = vm.deploy(&caller_private_key, program, None, 0, None, rng).unwrap();
-        add_and_test(&vm, &caller_private_key, &[deployment], rng);
+        add_and_test_with_costs(&vm, &caller_private_key, None, &[deployment], rng);
     }
 
     // Pre-compute field elements for valid network ("aleo") and mapping ("data0") identifiers.

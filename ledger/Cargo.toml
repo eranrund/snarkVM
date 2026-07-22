@@ -1,6 +1,6 @@
 [package]
 name = "snarkvm-ledger"
-version = "4.6.0"
+version = "4.7.3"
 authors = [ "The Aleo Team <hello@aleo.org>" ]
 description = "A node ledger for a decentralized virtual machine"
 homepage = "https://aleo.org"
@@ -45,6 +45,12 @@ harness = false
 required-features = [ "test-helpers", "rocks" ]
 
 [[bench]]
+name = "prepare_advance_multirecord"
+path = "benches/prepare_advance_multirecord/main.rs"
+harness = false
+required-features = [ "test-helpers", "rocks" ]
+
+[[bench]]
 name = "dag"
 path = "benches/dag.rs"
 harness = false
@@ -69,6 +75,10 @@ history = [
 history-staking-rewards = [
   "snarkvm-ledger-store/history-staking-rewards",
   "snarkvm-synthesizer/history-staking-rewards",
+]
+slipstream-plugins = [
+  "snarkvm-ledger-store/slipstream-plugins",
+  "snarkvm-synthesizer/slipstream-plugins",
 ]
 locktick = [
   "dep:locktick",
@@ -105,9 +115,9 @@ test-helpers = [
 test_targets = [
   "snarkvm-console/test_targets",
 ]
-timer = [ "aleo-std/timer" ]
+dev-committee = []
 dev-print = [ "snarkvm-utilities/dev-print" ]
-
+timer = [ "aleo-std/timer" ]
 
 [dependencies.snarkvm-console]
 workspace = true
@@ -156,6 +166,9 @@ workspace = true
 features = [ "storage" ]
 
 [dependencies.anyhow]
+workspace = true
+
+[dependencies.cfg-if]
 workspace = true
 
 [dependencies.indexmap]

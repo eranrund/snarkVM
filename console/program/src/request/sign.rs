@@ -191,4 +191,102 @@ impl<N: Network> Request<N> {
             is_dynamic,
         })
     }
+
+    /// Samples a `Request` with the given `signer`, `program_id`,
+    /// `function_name` and `inputs`. The fields `sk_tag`, `tvk`, `tcm`, `scm`,
+    /// `signature` and `input_ids` are random, but the size of the sampled
+    /// `Request` is the same as if it were correctly produced from the given
+    /// inputs and signed.
+    pub fn sample<R: Rng + CryptoRng>(
+        signer: Address<N>,
+        program_id: ProgramID<N>,
+        function_name: Identifier<N>,
+        inputs: impl ExactSizeIterator<Item = impl TryInto<Value<N>>>,
+        input_types: &[ValueType<N>],
+        is_dynamic: bool,
+        rng: &mut R,
+    ) -> Result<Self> {
+        // Ensure the number of inputs matches the number of input types.
+        if input_types.len() != inputs.len() {
+            bail!(
+                "'{program_id}/{function_name}' expects {} inputs, but {} were provided.",
+                input_types.len(),
+                inputs.len()
+            )
+        }
+
+        // Initialize a vector to store the prepared inputs.
+        let mut prepared_inputs = Vec::with_capacity(inputs.len());
+        // Initialize a vector to store the input IDs.
+        let mut input_ids = Vec::with_capacity(inputs.len());
+
+        // Prepare the inputs.
+        for (index, (input, input_type)) in inputs.zip_eq(input_types).enumerate() {
+            // Prepare the input.
+            let input = input.try_into().map_err(|_| {
+                anyhow!("Failed to parse input #{index} ('{input_type}') for '{program_id}/{function_name}'")
+            })?;
+            // If the function expects a dynamic record but a record was provided, convert it.
+            let input = match (&input, input_type) {
+                (Value::Record(record), ValueType::DynamicRecord) => {
+                    Value::DynamicRecord(DynamicRecord::from_record(record)?)
+                }
+                _ => input,
+            };
+            // Store the prepared input.
+            prepared_inputs.push(input.clone());
+
+            match input_type {
+                ValueType::Constant(..) => {
+                    input_ids.push(InputID::Constant(Field::rand(rng)));
+                }
+                ValueType::Public(..) => {
+                    input_ids.push(InputID::Public(Field::rand(rng)));
+                }
+                ValueType::Private(..) => {
+                    input_ids.push(InputID::Private(Field::rand(rng)));
+                }
+                ValueType::Record(..) => {
+                    input_ids.push(InputID::Record(
+                        Field::rand(rng),
+                        Group::rand(rng),
+                        Field::rand(rng),
+                        Field::rand(rng),
+                        Field::rand(rng),
+                    ));
+                }
+                ValueType::ExternalRecord(..) => {
+                    input_ids.push(InputID::ExternalRecord(Field::rand(rng)));
+                }
+                ValueType::Future(..) => bail!("A future is not a valid input"),
+                ValueType::DynamicRecord => {
+                    input_ids.push(InputID::DynamicRecord(Field::rand(rng)));
+                }
+                ValueType::DynamicFuture => bail!("A dynamic future is not a valid input"),
+            }
+        }
+
+        let challenge = Scalar::rand(rng);
+        let response = Scalar::rand(rng);
+
+        let compute_key = {
+            let private_key = PrivateKey::<N>::new(rng)?;
+            ComputeKey::<N>::try_from(private_key)?
+        };
+
+        Ok(Self {
+            signer,
+            network_id: U16::new(N::ID),
+            program_id,
+            function_name,
+            input_ids,
+            inputs: prepared_inputs,
+            signature: Signature::from((challenge, response, compute_key)),
+            sk_tag: Field::zero(),
+            tvk: Field::rand(rng),
+            tcm: Field::rand(rng),
+            scm: Field::rand(rng),
+            is_dynamic,
+        })
+    }
 }

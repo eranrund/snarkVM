@@ -34,7 +34,7 @@ use snarkvm_ledger_block::{
 };
 use snarkvm_ledger_store::{ConsensusStorage, ConsensusStore};
 use snarkvm_synthesizer::{Authorization, VM, program::FinalizeOperation};
-use snarkvm_synthesizer_process::{execution_cost, execution_cost_for_authorization};
+use snarkvm_synthesizer_process::{execution_cost, execution_cost_for_authorization, execution_cost_for_call};
 use snarkvm_synthesizer_program::FinalizeGlobalState;
 
 use anyhow::Result;
@@ -72,6 +72,9 @@ fn run_test(test: &ProgramTest) -> serde_yaml::Mapping {
         None => TestRng::fixed(123456789),
         Some(randomness) => TestRng::fixed(randomness),
     };
+
+    // RNG used only in `execution_cost_for_call`
+    let cost_rng = &mut TestRng::default();
 
     // Initialize a private key.
     let genesis_private_key = PrivateKey::<CurrentNetwork>::new(rng).unwrap();
@@ -221,6 +224,8 @@ fn run_test(test: &ProgramTest) -> serde_yaml::Mapping {
             None => genesis_private_key,
         };
 
+        let address = Address::try_from(&private_key).unwrap();
+
         // A helper function to run the test and extract the outputs as YAML, to be compared against the expectation.
         let mut run_test = || -> (serde_yaml::Value, serde_yaml::Value) {
             // Create a mapping to store the result of the test.
@@ -245,13 +250,27 @@ fn run_test(test: &ProgramTest) -> serde_yaml::Mapping {
             let consensus_version = CurrentNetwork::CONSENSUS_VERSION(vm.block_store().current_block_height()).unwrap();
             let execution = transaction.execution().unwrap();
 
-            // Test cost computation for Authorization
+            // Test cost computation given the Authorization and the request
             if consensus_version >= ConsensusVersion::V4 {
-                let actual_cost = execution_cost(&vm.process().read(), execution, consensus_version).unwrap();
+                let actual_cost = execution_cost(vm.process(), execution, consensus_version).unwrap();
+
                 let authorization = Authorization::from_unchecked((vec![], execution.transitions().cloned().collect()));
-                let expected_cost =
-                    execution_cost_for_authorization(&vm.process().read(), &authorization, consensus_version).unwrap();
-                assert_eq!(actual_cost, expected_cost);
+                let expected_cost_given_authorization =
+                    execution_cost_for_authorization(vm.process(), &authorization, consensus_version).unwrap();
+                assert_eq!(actual_cost, expected_cost_given_authorization);
+
+                let expected_cost_given_call = execution_cost_for_call::<CurrentAleo, _>(
+                    vm.process(),
+                    address,
+                    program_id,
+                    function_name,
+                    inputs.iter(),
+                    consensus_version,
+                    cost_rng,
+                )
+                .unwrap();
+
+                assert_eq!(actual_cost, expected_cost_given_call);
             }
 
             // Attempt to verify the transaction.
@@ -300,8 +319,11 @@ fn run_test(test: &ProgramTest) -> serde_yaml::Mapping {
                 }
             }
 
-            // Add the `execute` mapping to `result` mapping.
-            result.insert(serde_yaml::Value::String("execute".to_string()), serde_yaml::Value::Mapping(execute));
+            // Add the `execute` mapping to the `other` mapping so that it is stored in `additional` but not
+            // compared against the expected output. Transition outputs (ciphertexts, field IDs) are tied to
+            // the RNG state at a specific block height and change whenever the default `start_height` shifts
+            // due to a new ConsensusVersion, even when no semantic behavior changes.
+            other.insert(serde_yaml::Value::String("execute".to_string()), serde_yaml::Value::Mapping(execute));
             // Add the child outputs to the `other` mapping.
             other.insert(
                 serde_yaml::Value::String("child_outputs".to_string()),
@@ -631,6 +653,8 @@ fn construct_finalize_global_state<C: ConsensusStorage<CurrentNetwork>>(
         latest_cumulative_weight,
         0u128,
         latest_block.hash(),
+        None,
+        None,
     )
     .unwrap()
 }

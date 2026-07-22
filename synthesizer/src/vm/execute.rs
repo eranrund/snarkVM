@@ -17,6 +17,7 @@
 
 use super::*;
 
+use console::network::varuna_version_from_consensus;
 use snarkvm_synthesizer_error::*;
 
 impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
@@ -82,8 +83,7 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
             true => {
                 // Compute the minimum execution cost.
                 let consensus_version = N::CONSENSUS_VERSION(query.current_block_height()?)?;
-                let (minimum_execution_cost, _) =
-                    execution_cost(&self.process().read(), &execution, consensus_version)?;
+                let (minimum_execution_cost, _) = execution_cost(&self.process, &execution, consensus_version)?;
                 // Compute the execution ID.
                 let execution_id = execution.to_execution_id()?;
                 // Authorize the fee.
@@ -191,14 +191,11 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         // Determine the consensus version.
         let consensus_version = N::CONSENSUS_VERSION(query.current_block_height()?)?;
         // Check whether the authorization is for a valid program edition.
-        authorization.check_valid_edition(&self.process.read(), consensus_version)?;
+        authorization.check_valid_edition(&self.process, consensus_version)?;
         // Check whether the authorization is creating valid records.
         authorization.check_valid_records(consensus_version)?;
         // Determine which Varuna version to use.
-        let varuna_version = match (ConsensusVersion::V1..=ConsensusVersion::V3).contains(&consensus_version) {
-            true => VarunaVersion::V1,
-            false => VarunaVersion::V2,
-        };
+        let varuna_version = varuna_version_from_consensus(consensus_version);
         macro_rules! logic {
             ($process:expr, $network:path, $aleo:path) => {{
                 // Prepare the authorization.
@@ -216,7 +213,9 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                 // received as inputs or from callees exist on the ledger at the end of
                 // the execution (whether spent or not).
                 if consensus_version >= ConsensusVersion::V15 {
-                    $process.ensure_records_exist(trace.transitions().iter(), trace.call_graph())?;
+                    let include_direct_imports = consensus_version >= ConsensusVersion::V18;
+                    let execution_stacks = $process.get_stacks(trace.transitions(), include_direct_imports)?;
+                    Process::ensure_records_exist(trace.transitions().iter(), trace.call_graph(), &execution_stacks)?;
                     lap!(timer, "Check record existence");
                 }
 
@@ -249,14 +248,11 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
         // Determine the consensus version.
         let consensus_version = N::CONSENSUS_VERSION(query.current_block_height()?)?;
         // Check whether the authorization is for a valid program edition.
-        authorization.check_valid_edition(&self.process.read(), consensus_version)?;
+        authorization.check_valid_edition(&self.process, consensus_version)?;
         // Check whether the authorization is creating valid records.
         authorization.check_valid_records(consensus_version)?;
         // Determine which Varuna version to use.
-        let varuna_version = match (ConsensusVersion::V1..=ConsensusVersion::V3).contains(&consensus_version) {
-            true => VarunaVersion::V1,
-            false => VarunaVersion::V2,
-        };
+        let varuna_version = varuna_version_from_consensus(consensus_version);
         macro_rules! logic {
             ($process:expr, $network:path, $aleo:path) => {{
                 // Prepare the authorization.
@@ -274,7 +270,9 @@ impl<N: Network, C: ConsensusStorage<N>> VM<N, C> {
                 // received as inputs or from callees exist on the ledger at the end of
                 // the execution (whether spent or not).
                 if consensus_version >= ConsensusVersion::V15 {
-                    $process.ensure_records_exist(trace.transitions().iter(), trace.call_graph())?;
+                    let include_direct_imports = consensus_version >= ConsensusVersion::V18;
+                    let execution_stacks = $process.get_stacks(trace.transitions(), include_direct_imports)?;
+                    Process::ensure_records_exist(trace.transitions().iter(), trace.call_graph(), &execution_stacks)?;
                     lap!(timer, "Check record existence");
                 }
 
@@ -443,8 +441,8 @@ mod tests {
 
         let query = Query::VM(vm.block_store().clone());
         let (execution, _) = vm.execute_authorization_raw(authorization, &query, rng).unwrap();
-        let (cost, _) = execution_cost(&vm.process().read(), &execution, ConsensusVersion::V2).unwrap();
-        let (old_cost, _) = execution_cost(&vm.process().read(), &execution, ConsensusVersion::V1).unwrap();
+        let (cost, _) = execution_cost(vm.process(), &execution, ConsensusVersion::V2).unwrap();
+        let (old_cost, _) = execution_cost(vm.process(), &execution, ConsensusVersion::V1).unwrap();
 
         assert_eq!(34_060, cost);
         assert_eq!(51_060, old_cost);
@@ -580,7 +578,7 @@ finalize test:
 
         let query = Query::VM(vm.block_store().clone());
         let (execution, _) = vm.execute_authorization_raw(authorization, &query, rng).unwrap();
-        let (cost, _) = execution_cost(&vm.process().read(), &execution, ConsensusVersion::V1).unwrap();
+        let (cost, _) = execution_cost(vm.process(), &execution, ConsensusVersion::V1).unwrap();
         println!("Cost: {cost}");
     }
 
@@ -971,7 +969,7 @@ finalize test:
         assert_eq!(execution.transitions().len(), <CurrentNetwork as Network>::MAX_INPUTS + 1);
 
         // Get the finalize cost of the execution.
-        let (_, (_, finalize_cost)) = execution_cost(&vm.process().read(), &execution, ConsensusVersion::V2).unwrap();
+        let (_, (_, finalize_cost)) = execution_cost(vm.process(), &execution, ConsensusVersion::V2).unwrap();
 
         // Compute the expected cost as the sum of the cost in microcredits of each command in each finalize block of each transition in the execution.
         let mut expected_cost = 0;
@@ -980,7 +978,7 @@ finalize test:
             let program_id = transition.program_id();
             let function_name = transition.function_name();
             // Get the stack.
-            let stack = vm.process().read().get_stack(program_id).unwrap().clone();
+            let stack = vm.process().get_stack(program_id).unwrap().clone();
             // Get the finalize types.
             let finalize_types = stack.get_finalize_types(function_name).unwrap();
             // Get the finalize block of the transition and sum the cost of each command.
@@ -1120,7 +1118,7 @@ constructor:
         assert_eq!(execution.transitions().len(), Transaction::<CurrentNetwork>::MAX_TRANSITIONS - 1);
 
         // Get the finalize cost of the execution.
-        let (_, (_, finalize_cost)) = execution_cost(&vm.process().read(), &execution, ConsensusVersion::V2).unwrap();
+        let (_, (_, finalize_cost)) = execution_cost(vm.process(), &execution, ConsensusVersion::V2).unwrap();
 
         // Compute the expected cost as the sum of the cost in microcredits of each command in each finalize block of each transition in the execution.
         let mut expected_cost = 0;
@@ -1129,7 +1127,7 @@ constructor:
             let program_id = transition.program_id();
             let function_name = transition.function_name();
             // Get the stack.
-            let stack = vm.process().read().get_stack(program_id).unwrap().clone();
+            let stack = vm.process().get_stack(program_id).unwrap().clone();
             // Get the finalize types.
             let finalize_types = stack.get_finalize_types(function_name).unwrap();
             // Get the finalize block of the transition and sum the cost of each command.

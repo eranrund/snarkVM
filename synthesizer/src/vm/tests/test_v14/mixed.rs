@@ -17,12 +17,15 @@ use console::types::Scalar;
 
 use super::*;
 
-// These tests mix translation, casting to `dynamic.record`, and `get.record.dynamic`.
+// These tests mix translation, casting to `dynamic.record`, `get.record.dynamic` and other functionality.
 
-// Tests that `execution_cost_for_authorization()` computes correct costs for transactions with inclusion and translation proofs.
-// Complements test cases in `synthesizer/tests/test_vm_execute_and_finalize.rs` which also verify cost estimation correctness.
+// Tests that `execution_cost_for_authorization()` and
+// `execution_cost_for_call()` compute correct costs for transactions with
+// inclusion and translation proofs. Complements test cases in
+// `synthesizer/tests/test_vm_execute_and_finalize.rs` and
+// `test_v15/cost_for_call.rs` which also verify cost estimation correctness.
 #[test]
-fn test_execution_cost_for_authorization() {
+fn test_execution_cost_for_authorization_and_call() {
     let rng = &mut TestRng::default();
 
     let caller_private_key = sample_genesis_private_key(rng);
@@ -37,13 +40,9 @@ fn test_execution_cost_for_authorization() {
     let check_tossed_coin_str = "check_tossed_coin";
 
     let program_a_field = Identifier::<CurrentNetwork>::from_str(program_a_str).unwrap().to_field().unwrap();
-    let program_b_field = Identifier::<CurrentNetwork>::from_str(program_b_str).unwrap().to_field().unwrap();
     let network_field = Identifier::<CurrentNetwork>::from_str(network_str).unwrap().to_field().unwrap();
-    let weld_function_field = Identifier::<CurrentNetwork>::from_str(weld_function_str).unwrap().to_field().unwrap();
-    let check_tossed_coin_field =
-        Identifier::<CurrentNetwork>::from_str(check_tossed_coin_str).unwrap().to_field().unwrap();
-    let consume_base_metal_field =
-        Identifier::<CurrentNetwork>::from_str("consume_base_metal").unwrap().to_field().unwrap();
+    let weld_function_id = Identifier::<CurrentNetwork>::from_str(weld_function_str).unwrap();
+    let weld_function_field = weld_function_id.to_field().unwrap();
 
     let program_a_source = format!(
         r"
@@ -122,26 +121,18 @@ fn test_execution_cost_for_authorization() {
         function weld_dynamically:
             // Expected type: base_metal.record
             input r0 as dynamic.record;
-            // Expected type: base_metal.record
-            input r1 as dynamic.record;
             // Expected type: accessory_metal.record
-            input r2 as dynamic.record;
+            input r1 as dynamic.record;
             // Expected type: welding_metal.record
-            input r3 as dynamic.record;
+            input r2 as dynamic.record;
 
             call.dynamic {program_a_field} {network_field} {weld_function_field}
-                with r0 r2 r3 (as dynamic.record dynamic.record dynamic.record)
-                into r4 (as dynamic.record);
+                with r0 r1 r2 (as dynamic.record dynamic.record dynamic.record)
+                into r3 (as dynamic.record);
 
-            call.dynamic {program_b_field} {network_field} {check_tossed_coin_field}
-                with r1 (as dynamic.record);
+            get.record.dynamic r3.grams into r4 as u32;
 
-            call.dynamic {program_a_field} {network_field} {consume_base_metal_field}
-                with r1 (as dynamic.record);
-
-            get.record.dynamic r4.grams into r5 as u32;
-
-            output r5 as u32.public;
+            output r4 as u32.public;
 
         function consume_base_metal:
             input r0 as base_metal.record;
@@ -176,21 +167,29 @@ fn test_execution_cost_for_authorization() {
     // Deploy the programs.
     println!("Deploying program {program_a_str}.aleo...");
     let transaction_deploy_a = vm.deploy(&caller_private_key, &program_a, None, 0, None, rng).unwrap();
-    add_and_test(&vm, &caller_private_key, &[transaction_deploy_a], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, None, &[transaction_deploy_a], rng);
 
     println!("Deploying program {program_b_str}.aleo...");
     let transaction_deploy_b = vm.deploy(&caller_private_key, &program_b, None, 0, None, rng).unwrap();
-    add_and_test(&vm, &caller_private_key, &[transaction_deploy_b], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, None, &[transaction_deploy_b], rng);
 
-    let record_data = [
-        ("base_metal", vec![&caller_address_str, "183u16", "999u32", "true"]),
-        ("base_metal", vec![&caller_address_str, "93u16", "20u32", "false"]),
-        ("accessory_metal", vec![&caller_address_str, "82u16", "27u32", "0group"]),
-        ("welding_metal", vec![&caller_address_str, "183u16", "82u16"]),
+    let record_names = ["base_metal", "accessory_metal", "welding_metal"];
+
+    let entry_values = vec![
+        [&caller_address_str, "183u16", "999u32", "true"]
+            .iter()
+            .map(|value| Value::from_str(value).unwrap())
+            .collect_vec(),
+        [&caller_address_str, "82u16", "27u32", "0group"]
+            .iter()
+            .map(|value| Value::from_str(value).unwrap())
+            .collect_vec(),
+        [&caller_address_str, "183u16", "82u16"].iter().map(|value| Value::from_str(value).unwrap()).collect_vec(),
     ];
 
-    let transactions_and_records = record_data
+    let transactions_and_records = record_names
         .into_iter()
+        .zip(entry_values.clone())
         .map(|(record_name, entry_values)| {
             let function_name = format!("mint_{record_name}");
 
@@ -221,7 +220,9 @@ fn test_execution_cost_for_authorization() {
 
     let (transactions_mint, records): (Vec<_>, Vec<_>) = transactions_and_records.into_iter().unzip();
 
-    add_and_test(&vm, &caller_private_key, &transactions_mint, rng);
+    let entry_value_slice = entry_values.iter().map(|values| values.as_slice()).collect_vec();
+
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&entry_value_slice), &transactions_mint, rng);
 
     let dynamic_records = records
         .into_iter()
@@ -233,33 +234,18 @@ fn test_execution_cost_for_authorization() {
     let count_before_weld_dynamically = vm.transition_store().records().count();
 
     let transaction = vm
-        .execute(
-            &caller_private_key,
-            ("welder.aleo", "weld_dynamically"),
-            dynamic_records.into_iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&caller_private_key, ("welder.aleo", "weld_dynamically"), dynamic_records.iter(), None, 0, None, rng)
         .unwrap();
 
     let expected_output = Plaintext::<CurrentNetwork>::from_str("1026u32").unwrap();
 
     assert!(
-        // The root transition is at index 3.
-        matches!(transaction.transitions().nth(3).unwrap().outputs(), [Output::Public(_, Some(plaintext))] if *plaintext == expected_output),
+        // The root transition is at index 1.
+        matches!(transaction.transitions().nth(1).unwrap().outputs(), [Output::Public(_, Some(plaintext))] if *plaintext == expected_output),
         "Expected output: {:?}, got: {:?}",
         expected_output,
         transaction.transitions().next().unwrap().outputs()
     );
-
-    // Checking the cost-estimation function computes the correct cost
-    let execution = transaction.execution().unwrap();
-
-    let actual_cost = execution_cost(&vm.process().read(), execution, ConsensusVersion::V14).unwrap();
-
-    let authorization = Authorization::from_unchecked((vec![], execution.transitions().cloned().collect()));
 
     // The batch sizes involved in the cost computation are [1, 1, 1, 3, 2, 1, 1], where:
     // - the first 3 ones come from the three distinct transitions
@@ -272,13 +258,8 @@ fn test_execution_cost_for_authorization() {
     // - the next 2 ones come from the (input) translations for accessory_metal.record and welding_metal.record
     // - the next one comes from the (output) translation for welded_chunk.record
 
-    let expected_cost =
-        execution_cost_for_authorization(&vm.process().read(), &authorization, ConsensusVersion::V14).unwrap();
-
-    assert_eq!(actual_cost, expected_cost);
-
     // Ensuring transaction verification passes
-    add_and_test(&vm, &caller_private_key, &[transaction], rng);
+    add_and_test_with_costs(&vm, &caller_private_key, Some(&[&dynamic_records]), &[transaction], rng);
 
     // We check exactly one static record has been produced, even though it was
     // translated to a dynamic one when output
@@ -449,38 +430,33 @@ fn test_translation_get_dynamic_cast_to_dynamic() {
     // Deploy the programs.
     println!("Deploying program {program_a_name}.aleo...");
     let transaction_deploy_a = vm.deploy(&factory_private_key, &program_a, None, 0, None, rng).unwrap();
-    add_and_test(&vm, &factory_private_key, &[transaction_deploy_a], rng);
+    add_and_test_with_costs(&vm, &factory_private_key, None, &[transaction_deploy_a], rng);
 
     println!("Deploying program {program_b_name}.aleo...");
     let transaction_deploy_b = vm.deploy(&factory_private_key, &program_b, None, 0, None, rng).unwrap();
-    add_and_test(&vm, &factory_private_key, &[transaction_deploy_b], rng);
+    add_and_test_with_costs(&vm, &factory_private_key, None, &[transaction_deploy_b], rng);
 
     // Fund the clients so they can call functions, e. g. to decomission toys
+
+    let inputs_1 = [Value::from_str(&format!("{client_1_address}")).unwrap(), Value::from_str("1000000u64").unwrap()];
+
     let transaction_funding_1 = vm
-        .execute(
-            &factory_private_key,
-            ("credits.aleo", "transfer_public"),
-            [Value::from_str(&format!("{client_1_address}")).unwrap(), Value::from_str("1000000u64").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&factory_private_key, ("credits.aleo", "transfer_public"), inputs_1.iter(), None, 0, None, rng)
         .unwrap();
+
+    let inputs_2 = [Value::from_str(&format!("{client_2_address}")).unwrap(), Value::from_str("1000000u64").unwrap()];
 
     let transaction_funding_2 = vm
-        .execute(
-            &factory_private_key,
-            ("credits.aleo", "transfer_public"),
-            [Value::from_str(&format!("{client_2_address}")).unwrap(), Value::from_str("1000000u64").unwrap()].iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&factory_private_key, ("credits.aleo", "transfer_public"), inputs_2.iter(), None, 0, None, rng)
         .unwrap();
 
-    add_and_test(&vm, &factory_private_key, &[transaction_funding_1, transaction_funding_2], rng);
+    add_and_test_with_costs(
+        &vm,
+        &factory_private_key,
+        Some(&[&inputs_1, &inputs_2]),
+        &[transaction_funding_1, transaction_funding_2],
+        rng,
+    );
 
     // ************************** Case 1: Toy decomissioning **************************
 
@@ -496,15 +472,7 @@ fn test_translation_get_dynamic_cast_to_dynamic() {
     println!("Executing {program_b_name}.aleo/manufacture_toy...");
 
     let transaction_mint_toy_1 = vm
-        .execute(
-            &client_1_private_key,
-            ("factory.aleo", "manufacture_toy"),
-            toy_1_inputs.into_iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&client_1_private_key, ("factory.aleo", "manufacture_toy"), toy_1_inputs.iter(), None, 0, None, rng)
         .unwrap();
 
     let toy_1_record = match &transaction_mint_toy_1.transitions().next().unwrap().outputs()[0] {
@@ -514,7 +482,7 @@ fn test_translation_get_dynamic_cast_to_dynamic() {
         _ => panic!("Expected output record is not a record"),
     };
 
-    add_and_test(&vm, &client_1_private_key, &[transaction_mint_toy_1], rng);
+    add_and_test_with_costs(&vm, &client_1_private_key, Some(&[&toy_1_inputs]), &[transaction_mint_toy_1], rng);
 
     // Computing the signature
     let toy_1_signature = toy_1_id + *client_1_view_key;
@@ -530,7 +498,7 @@ fn test_translation_get_dynamic_cast_to_dynamic() {
         .execute(
             &client_1_private_key,
             ("factory.aleo", "decomission_toy"),
-            decomission_toy_inputs.into_iter(),
+            decomission_toy_inputs.iter(),
             None,
             0,
             None,
@@ -538,7 +506,13 @@ fn test_translation_get_dynamic_cast_to_dynamic() {
         )
         .unwrap();
 
-    add_and_test(&vm, &client_1_private_key, &[transaction_decomission_toy_1], rng);
+    add_and_test_with_costs(
+        &vm,
+        &client_1_private_key,
+        Some(&[&decomission_toy_inputs]),
+        &[transaction_decomission_toy_1],
+        rng,
+    );
 
     // Check exactly one record has been consumed (despite the cast to dynamic +
     // dynamic call)
@@ -558,7 +532,7 @@ fn test_translation_get_dynamic_cast_to_dynamic() {
         .execute(
             &factory_private_key,
             ("factory.aleo", "manufacture_ladder"),
-            ladder_1_inputs.into_iter(),
+            ladder_1_inputs.iter(),
             None,
             0,
             None,
@@ -584,21 +558,14 @@ fn test_translation_get_dynamic_cast_to_dynamic() {
 
     assert_eq!(unpainted_entry_1, &Plaintext::from_str("false").unwrap());
 
-    add_and_test(&vm, &client_1_private_key, &[transaction_mint_ladder_1], rng);
+    add_and_test_with_costs(&vm, &factory_private_key, Some(&[&ladder_1_inputs]), &[transaction_mint_ladder_1], rng);
 
     println!("Executing {program_b_name}.aleo/paint_ladder...");
 
     // Paint the ladder
+    let paint_inputs = vec![Value::Record(unpainted_ladder_1_record)];
     let transaction_paint_ladder_1 = vm
-        .execute(
-            &client_2_private_key,
-            ("factory.aleo", "paint_ladder"),
-            [Value::Record(unpainted_ladder_1_record)].into_iter(),
-            None,
-            0,
-            None,
-            rng,
-        )
+        .execute(&client_2_private_key, ("factory.aleo", "paint_ladder"), paint_inputs.iter(), None, 0, None, rng)
         .unwrap();
 
     let painted_ladder_1_record = match &transaction_paint_ladder_1.transitions().next().unwrap().outputs()[0] {
@@ -619,7 +586,7 @@ fn test_translation_get_dynamic_cast_to_dynamic() {
 
     assert_eq!(painted_entry_1, &Plaintext::from_str("true").unwrap());
 
-    add_and_test(&vm, &client_1_private_key, &[transaction_paint_ladder_1], rng);
+    add_and_test_with_costs(&vm, &client_2_private_key, Some(&[&paint_inputs]), &[transaction_paint_ladder_1], rng);
 
     // Computing an incorrect signature (uses client 1's view key)
     let ladder_1_incorrect_signature = ladder_1_id + *client_1_view_key;

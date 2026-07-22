@@ -385,6 +385,7 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
             next_last_coinbase_target,
             next_last_coinbase_timestamp,
         ) = to_next_targets::<N>(
+            N::CONSENSUS_VERSION(next_height)?,
             latest_cumulative_proof_target,
             combined_proof_target,
             latest_coinbase_target,
@@ -400,7 +401,7 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
             next_timestamp,
             N::GENESIS_TIMESTAMP,
             N::STARTING_SUPPLY,
-            N::ANCHOR_TIME,
+            N::REWARD_ANCHOR_TIME,
             N::ANCHOR_HEIGHT,
             N::BLOCK_TIME,
             combined_proof_target,
@@ -412,6 +413,11 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
         // Determine if the block timestamp should be included.
         let next_block_timestamp =
             (next_height >= N::CONSENSUS_HEIGHT(ConsensusVersion::V12).unwrap_or_default()).then_some(next_timestamp);
+        let (block_spend_limit, block_synthesis_limit) = if let Some(subdag) = subdag {
+            (subdag.spend_limit(next_height), subdag.synthesis_limit(next_height))
+        } else {
+            (None, None)
+        };
         // Construct the finalize state.
         let state = FinalizeGlobalState::new::<N>(
             next_round,
@@ -420,6 +426,8 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
             next_cumulative_weight,
             next_cumulative_proof_target,
             previous_block.hash(),
+            block_spend_limit,
+            block_synthesis_limit,
         )?;
         // Speculate over the ratifications, solutions, and transactions.
         let (ratifications, transactions, aborted_transaction_ids, ratified_finalize_operations) = self.vm.speculate(

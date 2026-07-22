@@ -112,6 +112,9 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
     fn check_block_subdag_inner(&self, block: &Block<N>, prefix: &[PendingBlock<N>]) -> Result<(), CheckBlockError<N>> {
         // Grab a lock to the latest_block in the ledger, to prevent concurrent writes to the ledger,
         // and to ensure that this check is atomic.
+        //
+        // Note: The latest block in the ledger is not necessarily the direct predecessor of `block`.
+        // If `prefix` is non-empty the direct predecessor is the last entry in the prefix.
         let latest_block = self.current_block.read();
 
         // First check that the heights and hashes of the pending block sequence and of the new block are correct.
@@ -149,8 +152,10 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
         // Ensure the certificates in the block subdag have met quorum requirements.
         self.check_block_subdag_quorum(block)?;
 
-        // Determine if the block subdag is correctly constructed and is not a combination of multiple subdags.
-        self.check_block_subdag_atomicity(block, &latest_block)?;
+        // Check subDAG atomicity against the latest block in the prefix.
+        // Only if the prefix is empty, check against the latest block in the ledger.
+        let predecessor = prefix.last().map_or(&*latest_block, |b| &**b);
+        self.check_block_subdag_atomicity(block, predecessor)?;
 
         // Ensure that all leaves of the subdag point to valid batches in other subdags/blocks.
         self.check_block_subdag_leaves(block, prefix)?;
@@ -226,6 +231,13 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
         // Determine if the block timestamp should be included.
         let block_timestamp = (block.height() >= N::CONSENSUS_HEIGHT(ConsensusVersion::V12).unwrap_or_default())
             .then_some(block.timestamp());
+        // Determine the block's spend limit.
+        let (block_spend_limit, block_synthesis_limit) = if let Authority::Quorum(subdag) = block.authority() {
+            (subdag.spend_limit(block.height()), subdag.synthesis_limit(block.height()))
+        } else {
+            (None, None)
+        };
+
         // Construct the finalize state.
         let state = FinalizeGlobalState::new::<N>(
             block.round(),
@@ -234,8 +246,9 @@ impl<N: Network, C: ConsensusStorage<N>> Ledger<N, C> {
             block.cumulative_weight(),
             block.cumulative_proof_target(),
             block.previous_hash(),
+            block_spend_limit,
+            block_synthesis_limit,
         )?;
-
         // Ensure speculation over the unconfirmed transactions is correct and ensure each transaction is well-formed and unique.
         let time_since_last_block = block.timestamp().saturating_sub(latest_block_timestamp);
         let ratified_finalize_operations = self.vm.check_speculate(

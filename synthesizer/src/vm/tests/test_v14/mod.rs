@@ -61,6 +61,10 @@ mod identifier_literal;
 // Tests for V3 deployments (amendments).
 mod amendments;
 
+// Helpers for tesing the function which authorizes a set of related requests.
+mod authorize_requests_helpers;
+use authorize_requests_helpers::reauthorize_from_execution;
+
 use super::*;
 
 use crate::{
@@ -74,7 +78,12 @@ use console::{
     network::ConsensusVersion,
     program::{DynamicRecord, Entry, Identifier, Value},
 };
-use snarkvm_synthesizer_process::{deployment_cost, execution_cost, execution_cost_for_authorization};
+use snarkvm_synthesizer_process::{
+    deployment_cost,
+    execution_cost,
+    execution_cost_for_authorization,
+    execution_cost_for_call,
+};
 use snarkvm_synthesizer_program::Program;
 use snarkvm_utilities::TestRng;
 
@@ -141,10 +150,16 @@ use snarkvm_utilities::TestRng;
 //   In: get_record_dynamic.rs::translate_transfer_public_to_private
 
 // Adds the given transactions to a new block and asserts all of them were
-// accepted
-fn add_and_test(
+// accepted, additionally checking that the cost estimations based on the
+// Authorization and the call target an inputs are correct. This is done if
+// and only if the `inputs` parameter is provided, which should not be done
+// for deployments. Furthermore, if that is the case, it is checked that
+// authorize_requests recovers a consistent authorization when provided
+// with the same requests.
+pub(crate) fn add_and_test_with_costs(
     vm: &VM<CurrentNetwork, LedgerType>,
     caller_private_key: &PrivateKey<CurrentNetwork>,
+    inputs: Option<&[&[Value<CurrentNetwork>]]>,
     transactions: &[Transaction<CurrentNetwork>],
     rng: &mut TestRng,
 ) {
@@ -173,6 +188,50 @@ fn add_and_test(
     assert_eq!(block.transactions().num_accepted(), transactions.len());
     assert_eq!(block.transactions().num_rejected(), 0);
     assert_eq!(block.aborted_transaction_ids().len(), 0);
+
     // Add the next block to the VM.
     vm.add_next_block(&block).unwrap();
+
+    // Check the cost estimation is correct:
+    if let Some(inputs) = inputs {
+        for (transaction, inputs) in transactions.iter().zip_eq(inputs) {
+            if let Some(execution) = transaction.execution() {
+                let actual_cost = execution_cost(vm.process(), execution, ConsensusVersion::V14).unwrap();
+                let authorization = Authorization::from_unchecked((vec![], execution.transitions().cloned().collect()));
+                let estimated_cost_authorization =
+                    execution_cost_for_authorization(vm.process(), &authorization, ConsensusVersion::V14).unwrap();
+                assert_eq!(actual_cost, estimated_cost_authorization);
+
+                let root_transition = execution.transitions().last().unwrap();
+                let estimated_cost_request = execution_cost_for_call::<CurrentAleo, _>(
+                    vm.process(),
+                    Address::try_from(caller_private_key).unwrap(),
+                    *root_transition.program_id(),
+                    *root_transition.function_name(),
+                    inputs.iter(),
+                    ConsensusVersion::V14,
+                    rng,
+                )
+                .unwrap();
+                assert_eq!(actual_cost, estimated_cost_request);
+
+                // Reconstruct an authorization from the execution using authorize_requests
+                let reauthorization = reauthorize_from_execution(vm, execution, inputs, caller_private_key, rng);
+                let reauthorized_transitions = reauthorization.transitions();
+
+                // Test consistency between the transitions in the original execution and the new reauthorization.
+                // All values can be compared directly except for tpk.
+                for (original, (tid, reauthorized)) in execution.transitions().zip_eq(reauthorized_transitions.iter()) {
+                    assert_eq!(original.id(), tid);
+                    assert_eq!(original.id(), reauthorized.id());
+                    assert_eq!(original.program_id(), reauthorized.program_id());
+                    assert_eq!(original.function_name(), reauthorized.function_name());
+                    assert_eq!(original.tcm(), reauthorized.tcm());
+                    assert_eq!(original.scm(), reauthorized.scm());
+                    assert_eq!(original.inputs(), reauthorized.inputs());
+                    assert_eq!(original.outputs(), reauthorized.outputs());
+                }
+            }
+        }
+    }
 }
