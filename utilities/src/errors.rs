@@ -168,6 +168,10 @@ impl<T> PrettyUnwrap for anyhow::Result<T> {
 #[track_caller]
 #[inline]
 pub fn try_vm_runtime<R, F: FnMut() -> R>(f: F) -> Result<R, Box<dyn Any + Send>> {
+    // Clear any stale panic info left behind by a panic caught outside our wrappers
+    // (e.g. by a raw `std::panic::catch_unwind`), so it cannot be misattributed to `f`.
+    let _ = PANIC_INFO.with(|info| info.take());
+
     // Perform the operation that may panic.
     let result = std::panic::catch_unwind(panic::AssertUnwindSafe(f));
 
@@ -203,6 +207,10 @@ pub fn try_vm_runtime<R, F: FnMut() -> R>(f: F) -> Result<R, Box<dyn Any + Send>
 /// `catch_unwind` calls the given closure `f` and, if `f` panics, returns the panic message and backtrace.
 #[inline]
 pub fn catch_unwind<R, F: FnMut() -> R>(f: F) -> Result<R, (String, Backtrace)> {
+    // Clear any stale panic info left behind by a panic caught outside our wrappers
+    // (e.g. by a raw `std::panic::catch_unwind`), so it cannot be misattributed to `f`.
+    let _ = PANIC_INFO.with(|info| info.take());
+
     // Perform the operation that may panic.
     std::panic::catch_unwind(panic::AssertUnwindSafe(f)).map_err(|_| {
         // Get the stored panic and backtrace from the thread-local variable.
@@ -346,6 +354,50 @@ mod tests {
         let result = catch_unwind(|| panic!("Top-level panic after successful VM run"));
         let (msg, _) = result.expect_err("Should have caught a panic");
         assert!(msg.ends_with("Top-level panic after successful VM run"), "Got: {msg}");
+    }
+
+    // Ensure `catch_unwind` never reports stale panic info left behind by a panic that was
+    // caught outside our wrappers (e.g. by tokio's blocking pool, which uses a raw
+    // `std::panic::catch_unwind` and thus never consumes `PANIC_INFO`).
+    #[test]
+    fn test_stale_panic_info_is_not_reported() {
+        set_panic_hook();
+
+        // A panic caught by a raw `std::panic::catch_unwind` stores info in `PANIC_INFO`
+        // without consuming it, leaving stale data on this thread.
+        let _ = std::panic::catch_unwind(|| panic!("stale message"));
+
+        // A hook-less panic (as produced by `resume_unwind`, e.g. cross-thread propagation)
+        // must not be attributed the stale message: `catch_unwind` must fail loudly on the
+        // missing panic info instead of returning the stale info.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            catch_unwind(|| -> () { std::panic::resume_unwind(Box::new("fresh payload".to_string())) })
+        }));
+        let payload = result.expect_err("catch_unwind must not report stale panic info");
+        let msg = payload.downcast::<String>().expect("Panic payload was not a string");
+        assert_eq!(*msg, "No panic information stored?");
+    }
+
+    // Ensure a successful `try_vm_runtime` also clears stale panic info, so a subsequent
+    // hook-less panic cannot be attributed to it.
+    #[test]
+    fn test_try_vm_runtime_clears_stale_panic_info() {
+        set_panic_hook();
+
+        // Leave stale data on this thread, as above.
+        let _ = std::panic::catch_unwind(|| panic!("stale message"));
+
+        // A successful run must clear the stale info.
+        let vm_result = try_vm_runtime(|| 42u32);
+        assert_eq!(vm_result.unwrap(), 42);
+
+        // A subsequent hook-less panic must fail loudly instead of reporting the stale info.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            catch_unwind(|| -> () { std::panic::resume_unwind(Box::new("fresh payload".to_string())) })
+        }));
+        let payload = result.expect_err("catch_unwind must not report stale panic info");
+        let msg = payload.downcast::<String>().expect("Panic payload was not a string");
+        assert_eq!(*msg, "No panic information stored?");
     }
 
     /// Ensure catch_unwind does not break `try_vm_runtime`.
