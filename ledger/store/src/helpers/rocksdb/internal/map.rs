@@ -643,13 +643,15 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> DataMap<K
     /// end), keeping only the rows `retain` accepts. The slice is one write, a range delete followed
     /// by puts of the kept rows, so an interrupted run leaves every slice either untouched or done,
     /// and redoing a finished slice changes nothing. The kept rows are held in memory meanwhile.
-    /// Bypasses the atomic batch: call it only when no batch is in progress. Returns the numbers of
-    /// kept and removed rows.
+    /// Bypasses the atomic batch: call it only when no batch is in progress. `readahead` is the
+    /// iterator's readahead size in bytes, 0 for RocksDB's default. Returns the numbers of kept and
+    /// removed rows.
     #[cfg(feature = "prune-authority-data")]
     pub fn retain_range(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
+        readahead: usize,
         mut retain: impl FnMut(&K, &V) -> bool,
     ) -> Result<(usize, usize)> {
         debug_assert!(!self.batch_in_progress.load(Ordering::SeqCst), "retain_range bypasses the atomic batch");
@@ -666,6 +668,9 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> DataMap<K
         options.set_total_order_seek(true);
         options.set_iterate_lower_bound(lower.clone());
         options.set_iterate_upper_bound(upper.clone());
+        if readahead > 0 {
+            options.set_readahead_size(readahead);
+        }
         let mut iter = self.database.raw_iterator_opt(options);
         iter.seek(&lower);
         let mut kept = Vec::new();
@@ -1702,5 +1707,91 @@ mod tests {
         assert_eq!(test_storage.extra_maps.own_map1.iter_confirmed().count(), 1);
         assert_eq!(test_storage.extra_maps.own_map2.iter_confirmed().count(), 1);
         assert_eq!(test_storage.extra_maps.extra_maps.own_map.iter_confirmed().count(), 0);
+    }
+
+    #[cfg(feature = "prune-authority-data")]
+    mod retain_range {
+        use super::*;
+        use crate::helpers::rocksdb::{TestMap, internal::schema::map_prefix};
+
+        type Row = ([u8; 2], u32);
+
+        /// A map with the given rows, plus one raw row in each neighbouring prefix.
+        fn setup(rows: &[Row]) -> (DataMap<[u8; 2], u32>, Vec<Vec<u8>>) {
+            let map: DataMap<[u8; 2], u32> =
+                RocksDB::open_map(0, StorageMode::new_test(None), MapID::Test(TestMap::Test)).unwrap();
+            for (key, value) in rows {
+                map.insert(*key, *value).unwrap();
+            }
+            let prefix = u32::from_be_bytes(map_prefix(0, MapID::Test(TestMap::Test)));
+            let neighbours: Vec<Vec<u8>> = [prefix - 1, prefix + 1]
+                .into_iter()
+                .flat_map(|p| {
+                    [[&p.to_be_bytes()[..], &[0, 0]].concat(), [&p.to_be_bytes()[..], &[0xff, 0xff]].concat()]
+                })
+                .collect();
+            for key in &neighbours {
+                map.database.put(key, b"n").unwrap();
+            }
+            (map, neighbours)
+        }
+
+        fn rows(map: &DataMap<[u8; 2], u32>) -> Vec<Row> {
+            map.iter_confirmed().map(|(k, v)| (*k, *v)).collect()
+        }
+
+        const ROWS: [Row; 6] =
+            [([0, 0], 1), ([0, 1], 9), ([0x7f, 0xff], 1), ([0x80, 0], 9), ([0x80, 1], 1), ([0xff, 0xff], 9)];
+
+        #[test]
+        fn test_slice_keeps_retained_and_drops_the_rest() {
+            let (map, neighbours) = setup(&ROWS);
+            let (kept, removed) = map.retain_range(&[0, 0], Some(&[0x80, 0]), 0, |_, v| *v > 5).unwrap();
+            assert_eq!((kept, removed), (1, 2));
+            // The slice `[0,0]..[0x80,0]` is half-open: `[0x80,0]` and above are untouched.
+            assert_eq!(rows(&map), vec![([0, 1], 9), ([0x80, 0], 9), ([0x80, 1], 1), ([0xff, 0xff], 9)]);
+            for key in &neighbours {
+                assert_eq!(map.database.get(key).unwrap().as_deref(), Some(&b"n"[..]), "{key:?}");
+            }
+        }
+
+        #[test]
+        fn test_slice_to_the_map_end_covers_the_last_key() {
+            let (map, neighbours) = setup(&ROWS);
+            let (kept, removed) = map.retain_range(&[0x80, 0], None, 64 << 10, |_, v| *v > 5).unwrap();
+            assert_eq!((kept, removed), (2, 1));
+            assert_eq!(rows(&map), vec![
+                ([0, 0], 1),
+                ([0, 1], 9),
+                ([0x7f, 0xff], 1),
+                ([0x80, 0], 9),
+                ([0xff, 0xff], 9)
+            ]);
+            for key in &neighbours {
+                assert_eq!(map.database.get(key).unwrap().as_deref(), Some(&b"n"[..]), "{key:?}");
+            }
+        }
+
+        #[test]
+        fn test_rerunning_a_slice_changes_nothing() {
+            let (map, _) = setup(&ROWS);
+            map.retain_range(&[], None, 0, |_, v| *v > 5).unwrap();
+            let after_first = rows(&map);
+            assert_eq!(after_first.len(), 3);
+            let (kept, removed) = map.retain_range(&[], None, 0, |_, v| *v > 5).unwrap();
+            assert_eq!((kept, removed), (3, 0));
+            assert_eq!(rows(&map), after_first);
+            // An empty slice is a caller error, not a silent no-op.
+            assert!(map.retain_range(&[0x80, 0], Some(&[0x80, 0]), 0, |_, _| true).is_err());
+        }
+
+        #[test]
+        fn test_slice_boundaries_use_the_key_bytes() {
+            let (map, _) = setup(&ROWS);
+            // Everything in the first half goes; the second half is not read.
+            let (kept, removed) = map.retain_range(&[], Some(&[0x80]), 0, |_, _| false).unwrap();
+            assert_eq!((kept, removed), (0, 3));
+            assert_eq!(rows(&map), vec![([0x80, 0], 9), ([0x80, 1], 1), ([0xff, 0xff], 9)]);
+        }
     }
 }
