@@ -318,9 +318,9 @@ fn prune_authority_heights<N: Network, B: BlockStorage<N>>(storage: &B, heights:
 }
 
 /// Prunes, when opening storage, the authorities between the watermark and the retained window,
-/// then the certificate indexes of every pruned block.
+/// then the certificate indexes of every pruned block. Public for `examples/prune_bench.rs`.
 #[cfg(feature = "prune-authority-data")]
-fn prune_expired_authorities<N: Network, B: BlockStorage<N>>(storage: &B, latest_height: u32) -> Result<()> {
+pub fn prune_expired_authorities<N: Network, B: BlockStorage<N>>(storage: &B, latest_height: u32) -> Result<()> {
     let watermark = storage.authority_pruned_below()?;
     if let Some(below) = prune_authority_range(storage, watermark, oldest_retained_authority_height(latest_height))? {
         prune_certificate_indexes(storage, below)?;
