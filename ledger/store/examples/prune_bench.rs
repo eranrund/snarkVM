@@ -26,13 +26,11 @@ use snarkvm_console::{
 use snarkvm_ledger_store::{
     AUTHORITY_RETENTION_BLOCKS,
     BlockStorage,
-    helpers::{
-        MapRead,
-        rocksdb::{BlockDB, BlockMap, Database, MapID, PREFIX_LEN, RocksDB},
-    },
+    helpers::rocksdb::{BlockDB, BlockMap, Database, MapID, PREFIX_LEN, RocksDB},
     oldest_retained_authority_height,
     prune_expired_authorities,
 };
+use snarkvm_utilities::bytes::unchecked_deserialize;
 use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -53,18 +51,26 @@ Commands (all take the database directory first):
         command after an interruption.
   settle <db_dir>              Flushes and waits for background compaction to finish.
   status <db_dir>              Prints the watermark and level layout.
-  scan <db_dir> [--raw]        Iterates the certificate map and counts the rows a pass would remove.
-                               --raw decodes only the height from the raw bytes.
+  scan <db_dir> [--raw]        Iterates the certificate map and counts the rows a pass would remove,
+                               decoding keys and values as the store does. --raw decodes only the
+                               height from the raw value bytes.
   prune <db_dir>               The production pass (`prune_expired_authorities`). Its log lines
                                give the scan+delete time and the compaction time separately.
   prune-parallel <db_dir> <threads> [--no-compact]
                                One forward iterator and direct point deletes per key-range thread,
                                then one compaction.
-  rebuild <db_dir> <slices> [--threads N] [--no-compact]
-                               Rewrites the map in <slices> key ranges, each one range delete plus
-                               puts of the kept rows, then one compaction.
+  rebuild <db_dir> [slices] [--threads N] [--no-compact]
+                               Rewrites the map in key-range slices (default 256), each one range
+                               delete plus puts of the kept rows, then one compaction.
   compact-certs <db_dir>       Compacts the certificate map's key range.
   restart <db_dir>             The production pass again, when there is nothing left to remove.
+
+Flags for every command:
+  --readahead <bytes>          Iterator readahead (RocksDB default 0: automatic, 8 KB to 256 KB per
+                               file). Not applied to `prune`/`restart`, which use the store's iterator.
+  --subcompactions <n>         Opens the store with max_subcompactions = n (via the env var
+                               SNARKVM_ROCKSDB_MAX_SUBCOMPACTIONS), so a manual compaction can use
+                               more than one thread. Default: the store's setting (1).
 
 Every variant prints wall time per phase, rows scanned and removed, disk bytes read and written by
 this process, write stalls found in the RocksDB LOG, and RocksDB properties before and after.
@@ -80,13 +86,14 @@ Dataset (about 570M rows, 21.3M heights x 27):
   $BIN build-index /data/certs 21300000 27 1
   snapshot or copy /data/certs now, and restore it before each variant
 Variants, each on a fresh copy of the dataset:
-  $BIN scan /data/certs; $BIN scan /data/certs --raw
-  $BIN prune /data/certs;                          $BIN restart /data/certs
-  $BIN prune-parallel /data/certs 8;               $BIN restart /data/certs
-  $BIN rebuild /data/certs 16;                     $BIN restart /data/certs
-  $BIN rebuild /data/certs 256 --threads 8;        $BIN restart /data/certs
-Restart cost before compaction: run a variant with --no-compact, then restart, then compact-certs,
-then restart again.
+  $BIN scan /data/certs; $BIN scan /data/certs --raw; $BIN scan /data/certs --readahead 2097152
+  $BIN prune /data/certs;                                $BIN restart /data/certs
+  $BIN prune-parallel /data/certs 1 --readahead 2097152; $BIN restart /data/certs
+  $BIN prune-parallel /data/certs 8;                     $BIN restart /data/certs
+  $BIN rebuild /data/certs --readahead 2097152;          $BIN restart /data/certs
+  $BIN rebuild /data/certs --threads 8 --subcompactions 8; $BIN restart /data/certs
+Restart cost before compaction: run a variant with --no-compact, then restart, then compact-certs
+(optionally --subcompactions 8), then restart again.
 ";
 
 /// A copy of the block store's private `is_pruned_height`.
@@ -120,11 +127,14 @@ fn slice_bounds(i: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
     (bound(i), bound(i + 1))
 }
 
-fn range_iter<'a>(db: &'a rocksdb::DB, lower: &[u8], upper: &[u8]) -> rocksdb::DBRawIterator<'a> {
+fn range_iter<'a>(db: &'a rocksdb::DB, lower: &[u8], upper: &[u8], readahead: usize) -> rocksdb::DBRawIterator<'a> {
     let mut options = rocksdb::ReadOptions::default();
     options.set_total_order_seek(true);
     options.set_iterate_lower_bound(lower.to_vec());
     options.set_iterate_upper_bound(upper.to_vec());
+    if readahead > 0 {
+        options.set_readahead_size(readahead);
+    }
     let mut iter = db.raw_iterator_opt(options);
     iter.seek(lower);
     iter
@@ -191,12 +201,15 @@ fn print_props(db: &RocksDB, label: &str, full: bool) {
     for p in [
         "rocksdb.num-running-compactions",
         "rocksdb.estimate-pending-compaction-bytes",
+        "rocksdb.num-files-at-level0",
+        "rocksdb.is-write-stopped",
+        "rocksdb.actual-delayed-write-rate",
         "rocksdb.total-sst-files-size",
         "rocksdb.estimate-num-keys",
     ] {
         println!("{p} = {}", db.property_int_value(p).ok().flatten().unwrap_or(0));
     }
-    let mut props = vec!["rocksdb.levelstats"];
+    let mut props = vec!["rocksdb.cf-write-stall-stats", "rocksdb.levelstats"];
     if full {
         props.push("rocksdb.stats");
     }
@@ -209,16 +222,22 @@ struct Bench {
     storage: BlockDB<N>,
     db: RocksDB,
     log: PathBuf,
+    readahead: usize,
 }
 
 impl Bench {
-    fn open(db_dir: &str) -> Result<Self> {
+    fn open(db_dir: &str, readahead: usize, subcompactions: Option<u32>) -> Result<Self> {
+        if let Some(n) = subcompactions {
+            // SAFETY: no other thread is running yet.
+            unsafe { std::env::set_var("SNARKVM_ROCKSDB_MAX_SUBCOMPACTIONS", n.to_string()) };
+            println!("max_subcompactions = {n}");
+        }
         let mode = StorageMode::Custom(PathBuf::from(db_dir), None);
         let t = Instant::now();
         let storage = BlockDB::<N>::open(mode.clone())?;
         let db = RocksDB::open(N::ID, mode.clone())?;
         println!("opened {db_dir} in {:.2} s", t.elapsed().as_secs_f64());
-        Ok(Self { storage, db, log: aleo_std_storage::aleo_ledger_dir(N::ID, &mode).join("LOG") })
+        Ok(Self { storage, db, log: aleo_std_storage::aleo_ledger_dir(N::ID, &mode).join("LOG"), readahead })
     }
 
     fn watermark(&self) -> Result<u32> {
@@ -289,7 +308,7 @@ fn random_key(rng: &mut SplitMix, key: &mut [u8]) {
     key[31] &= 0x0f;
 }
 
-fn build_index(db_dir: &str, heights: u32, certs: u32, seed: u64) -> Result<()> {
+fn build_index(bench: &Bench, db_dir: &str, heights: u32, certs: u32, seed: u64) -> Result<()> {
     ensure!(heights > AUTHORITY_RETENTION_BLOCKS, "heights must exceed the retention window");
     // The bench writes raw keys; make sure they match what `DataMap` would write.
     let mut sample = [0u8; 32];
@@ -297,7 +316,6 @@ fn build_index(db_dir: &str, heights: u32, certs: u32, seed: u64) -> Result<()> 
     let field = Field::<N>::from_bytes_le(&sample)?;
     ensure!(bincode::serialize(&field)? == sample, "raw key encoding differs from bincode's");
 
-    let bench = Bench::open(db_dir)?;
     let progress_path = Path::new(db_dir).join("prune_bench_build.progress");
     let header = format!("{heights} {certs} {seed}");
     let mut start = 1u32;
@@ -327,14 +345,14 @@ fn build_index(db_dir: &str, heights: u32, certs: u32, seed: u64) -> Result<()> 
             batch.put(&key, value);
         }
         rows += u64::from(certs);
-        if height % 1_000 == 0 {
+        if height.is_multiple_of(1_000) {
             db.write_opt(std::mem::take(&mut batch), &write_options)?;
         }
-        if height % 500_000 == 0 {
+        if height.is_multiple_of(500_000) {
             db.flush()?;
             save_progress(height + 1)?;
         }
-        if height % 100_000 == 0 {
+        if height.is_multiple_of(100_000) {
             let secs = t.elapsed().as_secs_f64();
             println!("height {height}: {rows} rows, {:.0} rows/s, {secs:.0} s", rows as f64 / secs);
         }
@@ -356,28 +374,28 @@ fn scan(bench: &Bench, raw: bool) -> Result<()> {
     let below = bench.watermark()?;
     let (t, mut scanned, mut removable) = (Instant::now(), 0usize, 0usize);
     let report = |scanned: usize, removable: usize| {
-        if scanned % 50_000_000 == 0 {
+        if scanned.is_multiple_of(50_000_000) {
             let secs = t.elapsed().as_secs_f64();
             println!("scanned {scanned}, removable {removable}, {:.0} rows/s, {secs:.0} s", scanned as f64 / secs);
         }
     };
     bench.timed(if raw { "scan --raw" } else { "scan" }, || {
-        if raw {
-            let mut iter = range_iter(bench.raw_db(), &cert_prefix(), &cert_prefix_end());
-            while let Some((_, value)) = iter.item() {
-                scanned += 1;
-                removable += usize::from(is_pruned_height(below, raw_height(value)?));
-                report(scanned, removable);
-                iter.next();
-            }
-            iter.status()?;
-        } else {
-            for (_, index) in bench.storage.certificate_map().iter_confirmed() {
-                scanned += 1;
-                removable += usize::from(is_pruned_height(below, index.0));
-                report(scanned, removable);
-            }
+        let mut iter = range_iter(bench.raw_db(), &cert_prefix(), &cert_prefix_end(), bench.readahead);
+        while let Some((key, value)) = iter.item() {
+            scanned += 1;
+            let height = if raw {
+                raw_height(value)?
+            } else {
+                // The same decoding as the store's `iter_confirmed`.
+                let _id: Field<N> = unchecked_deserialize(&key[PREFIX_LEN..])?;
+                let index: (u32, u64) = unchecked_deserialize(value)?;
+                index.0
+            };
+            removable += usize::from(is_pruned_height(below, height));
+            report(scanned, removable);
+            iter.next();
         }
+        iter.status()?;
         Ok(())
     })?;
     println!("scanned {scanned} rows, {removable} removable, {:.0} rows/s", scanned as f64 / t.elapsed().as_secs_f64());
@@ -402,7 +420,7 @@ fn prune_parallel(bench: &Bench, threads: usize, compact: bool) -> Result<()> {
                     let (scanned, removed) = (&scanned, &removed);
                     scope.spawn(move || -> Result<()> {
                         let db = bench.raw_db();
-                        let mut iter = range_iter(db, &lower, &upper);
+                        let mut iter = range_iter(db, &lower, &upper, bench.readahead);
                         let mut batch = rocksdb::WriteBatch::default();
                         let (mut n, mut r) = (0usize, 0usize);
                         while let Some((key, value)) = iter.item() {
@@ -456,9 +474,10 @@ fn rebuild(bench: &Bench, slices: usize, threads: usize, compact: bool) -> Resul
                             let (k, r) = bench.storage.certificate_map().retain_range(
                                 &start,
                                 end.as_ref().map(|e| &e[..]),
+                                bench.readahead,
                                 |_, (height, _)| !is_pruned_height(below, *height),
                             )?;
-                            if slices <= 64 || i % (slices / 16) == 0 {
+                            if slices <= 64 || i.is_multiple_of(slices / 16) {
                                 println!("slice {i}: kept {k}, removed {r}, {:.1} s", t.elapsed().as_secs_f64());
                             }
                             kept.fetch_add(k, Ordering::Relaxed);
@@ -482,13 +501,13 @@ fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
-fn flag_value<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> Result<T>
+fn flag_value<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>>
 where
     T::Err: std::error::Error + Send + Sync + 'static,
 {
     match args.iter().position(|a| a == name) {
-        Some(i) => Ok(args.get(i + 1).with_context(|| format!("{name} needs a value"))?.parse()?),
-        None => Ok(default),
+        Some(i) => Ok(Some(args.get(i + 1).with_context(|| format!("{name} needs a value"))?.parse()?)),
+        None => Ok(None),
     }
 }
 
@@ -505,10 +524,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let db_dir = arg(1)?;
+    let bench =
+        Bench::open(db_dir, flag_value(&args, "--readahead")?.unwrap_or(0), flag_value(&args, "--subcompactions")?)?;
     if command == "build-index" {
-        return build_index(db_dir, arg(2)?.parse()?, arg(3)?.parse()?, arg(4)?.parse()?);
+        return build_index(&bench, db_dir, arg(2)?.parse()?, arg(3)?.parse()?, arg(4)?.parse()?);
     }
-    let bench = Bench::open(db_dir)?;
     print_props(&bench.db, "at open", true);
     match command.as_str() {
         "settle" => bench.settle()?,
@@ -519,7 +539,11 @@ fn main() -> Result<()> {
         "prune" | "restart" => prune(&bench)?,
         "prune-parallel" => prune_parallel(&bench, arg(2)?.parse()?, !flag(&args, "--no-compact"))?,
         "rebuild" => {
-            rebuild(&bench, arg(2)?.parse()?, flag_value(&args, "--threads", 1)?, !flag(&args, "--no-compact"))?
+            let slices = match args.get(2).filter(|a| !a.starts_with("--")) {
+                Some(slices) => slices.parse()?,
+                None => 256,
+            };
+            rebuild(&bench, slices, flag_value(&args, "--threads")?.unwrap_or(1), !flag(&args, "--no-compact"))?
         }
         "compact-certs" => bench.compact()?,
         other => bail!("unknown command {other}; see --help"),
