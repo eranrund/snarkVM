@@ -230,6 +230,18 @@ impl<N: Network> BlockStorage<N> for BlockDB<N> {
         self.certificate_map.compact()
     }
 
+    /// Rewrites one key-range slice of the certificate map. See `DataMap::retain_range`.
+    #[cfg(feature = "prune-authority-data")]
+    fn retain_certificate_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        readahead: usize,
+        retain: impl FnMut(&Field<N>, &(u32, u64)) -> bool,
+    ) -> Result<Option<(usize, usize)>> {
+        self.certificate_map.retain_range(start, end, readahead, retain).map(Some)
+    }
+
     /// Returns the block metadata map.
     fn block_metadata_map(&self) -> &Self::BlockMetadataMap {
         &self.block_metadata_map

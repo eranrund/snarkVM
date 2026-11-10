@@ -228,6 +228,20 @@ const CERTIFICATE_PRUNING_CLOCK_ROWS: usize = 100_000;
 #[cfg(feature = "prune-authority-data")]
 const CERTIFICATE_PRUNING_BATCH_SIZE: usize = if cfg!(test) { 3 } else { 10_000 };
 
+/// The number of key-range slices the certificate rebuild rewrites, one write each. Certificate IDs
+/// are field elements whose first bytes are uniform, so the slices split the first two key bytes
+/// evenly. Unit tests use a few slices, so each holds a few rows.
+#[cfg(feature = "prune-authority-data")]
+const CERTIFICATE_REBUILD_SLICES: usize = if cfg!(test) { 4 } else { 256 };
+
+/// The number of threads that rewrite certificate slices concurrently.
+#[cfg(feature = "prune-authority-data")]
+const CERTIFICATE_REBUILD_THREADS: usize = if cfg!(test) { 2 } else { 4 };
+
+/// The iterator readahead of each certificate slice scan, in bytes.
+#[cfg(feature = "prune-authority-data")]
+const CERTIFICATE_REBUILD_READAHEAD: usize = 4 << 20;
+
 /// A block's authority, or why it is absent.
 #[derive(Clone, Debug)]
 pub enum BlockAuthority<N: Network> {
@@ -331,12 +345,15 @@ fn prune_authority_heights<N: Network, B: BlockStorage<N>>(storage: &B, heights:
 }
 
 /// Prunes, when opening storage, the authorities between the watermark and the retained window,
-/// then the certificate indexes of every pruned block.
+/// then the certificate indexes of every pruned block. When this run pruned more than half of all
+/// heights, as the first run after enabling the feature does, most certificate rows go, and the
+/// certificate map is rebuilt instead of thinned row by row.
 #[cfg(feature = "prune-authority-data")]
 fn prune_expired_authorities<N: Network, B: BlockStorage<N>>(storage: &B, latest_height: u32) -> Result<()> {
     let watermark = storage.authority_pruned_below()?;
     if let Some(below) = prune_authority_range(storage, watermark, oldest_retained_authority_height(latest_height))? {
-        prune_certificate_indexes(storage, below)?;
+        let pruned_now = below.saturating_sub(watermark.unwrap_or(1));
+        prune_certificate_indexes(storage, below, pruned_now > latest_height / 2)?;
     }
     Ok(())
 }
@@ -377,10 +394,123 @@ fn prune_authority_range<N: Network, B: BlockStorage<N>>(
     Ok(Some(floor))
 }
 
-/// Removes the certificate indexes of blocks below `below`, in one pass over the small index rows.
-/// It runs on every startup, since inserts leave these rows behind.
+/// Removes the certificate indexes of blocks below `below`. It runs on every startup, since inserts
+/// leave these rows behind. With `rebuild`, storage that supports it rewrites the map in key-range
+/// slices, which is far cheaper when most rows go; otherwise, and on every routine startup, the
+/// rows are deleted one by one in one pass over the map. A large removal is followed by a compaction.
 #[cfg(feature = "prune-authority-data")]
-fn prune_certificate_indexes<N: Network, B: BlockStorage<N>>(storage: &B, below: u32) -> Result<()> {
+fn prune_certificate_indexes<N: Network, B: BlockStorage<N>>(storage: &B, below: u32, rebuild: bool) -> Result<()> {
+    let removed = match rebuild {
+        true => rebuild_certificate_indexes(storage, below)?,
+        false => None,
+    };
+    let removed = match removed {
+        Some(removed) => removed,
+        None => delete_certificate_indexes(storage, below)?,
+    };
+
+    // Compact after a large deletion, so later startups do not read past its tombstones.
+    if removed < AUTHORITY_PRUNING_COMPACTION_THRESHOLD {
+        return Ok(());
+    }
+    #[cfg(test)]
+    CERTIFICATE_COMPACTIONS.with(|count| count.set(count.get() + 1));
+    info!("Compacting the certificate map; this can take a while");
+    let timer = std::time::Instant::now();
+    storage.compact_certificate_map()?;
+    info!("Compacted the certificate map in {:.1} s", timer.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// Rewrites the certificate map in [`CERTIFICATE_REBUILD_SLICES`] key-range slices on
+/// [`CERTIFICATE_REBUILD_THREADS`] threads, dropping the indexes of blocks below `below`, and returns
+/// the number of rows removed. Each slice is one write, so an interrupted run leaves every slice
+/// untouched or done, and the next startup redoes the pass. `None` if the storage has no range rewrite.
+#[cfg(feature = "prune-authority-data")]
+fn rebuild_certificate_indexes<N: Network, B: BlockStorage<N>>(storage: &B, below: u32) -> Result<Option<usize>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// The first two key bytes of slice `i`; `None` for `i == CERTIFICATE_REBUILD_SLICES`, the map's end.
+    fn slice_start(i: usize) -> Option<[u8; 2]> {
+        (i < CERTIFICATE_REBUILD_SLICES)
+            .then(|| u16::try_from(i * 65536 / CERTIFICATE_REBUILD_SLICES).expect("slice below count").to_be_bytes())
+    }
+
+    let total = CERTIFICATE_REBUILD_SLICES;
+    info!("Rebuilding the certificate map without the indexes of pruned blocks below block {below}, in {total} slices");
+    let timer = std::time::Instant::now();
+    let next_slice = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let kept = AtomicUsize::new(0);
+    let removed = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let next_report = Mutex::new(CERTIFICATE_PRUNING_REPORT_INTERVAL);
+
+    // Returns `false` if the storage has no range rewrite.
+    let worker = || -> Result<bool> {
+        loop {
+            let i = next_slice.fetch_add(1, Ordering::Relaxed);
+            if i >= total || failed.load(Ordering::Relaxed) {
+                return Ok(true);
+            }
+            let start = slice_start(i).expect("slice below count");
+            let end = slice_start(i + 1);
+            let result = storage.retain_certificate_range(
+                &start,
+                end.as_ref().map(<[u8; 2]>::as_slice),
+                CERTIFICATE_REBUILD_READAHEAD,
+                |_, index| !is_pruned_height(below, index.0),
+            );
+            let (k, r) = match result {
+                Ok(Some(counts)) => counts,
+                Ok(None) => return Ok(false),
+                Err(error) => {
+                    failed.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
+            kept.fetch_add(k, Ordering::Relaxed);
+            removed.fetch_add(r, Ordering::Relaxed);
+            let done = done.fetch_add(1, Ordering::Relaxed) + 1;
+
+            let mut next_report = next_report.lock();
+            let elapsed = timer.elapsed();
+            if elapsed >= *next_report && done < total {
+                let remaining = elapsed.as_secs_f64() * (total - done) as f64 / done as f64;
+                info!(
+                    "Rebuilt {done} of {total} certificate slices, kept {} rows, removed {}, in {:.0} s, about {remaining:.0} s left",
+                    kept.load(Ordering::Relaxed),
+                    removed.load(Ordering::Relaxed),
+                    elapsed.as_secs_f64()
+                );
+                *next_report = elapsed + CERTIFICATE_PRUNING_REPORT_INTERVAL;
+            }
+        }
+    };
+
+    let supported = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..CERTIFICATE_REBUILD_THREADS).map(|_| scope.spawn(worker)).collect();
+        let mut supported = true;
+        for worker in workers {
+            supported &= worker.join().map_err(|_| anyhow::anyhow!("A certificate rebuild thread panicked"))??;
+        }
+        Ok::<_, anyhow::Error>(supported)
+    })?;
+    if !supported {
+        return Ok(None);
+    }
+
+    #[cfg(test)]
+    CERTIFICATE_REBUILDS.with(|count| count.set(count.get() + 1));
+    let (kept, removed) = (kept.into_inner(), removed.into_inner());
+    info!("Rebuilt the certificate map in {:.1} s: kept {kept} rows, removed {removed}", timer.elapsed().as_secs_f64());
+    Ok(Some(removed))
+}
+
+/// Removes the certificate indexes of blocks below `below` one by one, in one pass over the map, and
+/// returns the number removed.
+#[cfg(feature = "prune-authority-data")]
+fn delete_certificate_indexes<N: Network, B: BlockStorage<N>>(storage: &B, below: u32) -> Result<usize> {
     let flush = |batch: &[Field<N>]| -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -424,24 +554,15 @@ fn prune_certificate_indexes<N: Network, B: BlockStorage<N>>(storage: &B, below:
     } else {
         debug!("No certificate indexes of pruned blocks to remove ({:.1} s)", timer.elapsed().as_secs_f64());
     }
-
-    // Compact after a large deletion, so later startups do not read past its tombstones.
-    if removed < AUTHORITY_PRUNING_COMPACTION_THRESHOLD {
-        return Ok(());
-    }
-    #[cfg(test)]
-    CERTIFICATE_COMPACTIONS.with(|count| count.set(count.get() + 1));
-    info!("Compacting the certificate map; this can take a while");
-    let timer = std::time::Instant::now();
-    storage.compact_certificate_map()?;
-    info!("Compacted the certificate map in {:.1} s", timer.elapsed().as_secs_f64());
-    Ok(())
+    Ok(removed)
 }
 
 #[cfg(all(test, feature = "prune-authority-data"))]
 thread_local! {
     /// The number of compactions the certificate pass has started on this thread.
     static CERTIFICATE_COMPACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The number of certificate map rebuilds the certificate pass has completed on this thread.
+    static CERTIFICATE_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A trait for block storage.
@@ -532,6 +653,21 @@ pub trait BlockStorage<N: Network>: 'static + Clone + Send + Sync {
     /// without deferred compaction does nothing.
     fn compact_certificate_map(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Rewrites the certificate rows whose serialized keys are in `start..end` (`None`: the map's
+    /// end), keeping only the rows `retain` accepts, in one write. Returns the numbers of kept and
+    /// removed rows, or `None` if the storage has no range rewrite. Bypasses the atomic batch: only
+    /// the startup pass calls it, before any insert.
+    #[cfg(feature = "prune-authority-data")]
+    fn retain_certificate_range(
+        &self,
+        _start: &[u8],
+        _end: Option<&[u8]>,
+        _readahead: usize,
+        _retain: impl FnMut(&Field<N>, &(u32, u64)) -> bool,
+    ) -> Result<Option<(usize, usize)>> {
+        Ok(None)
     }
 
     /// Returns the authority-pruning watermark `W`: the authority data of every height in `1..W` has
@@ -2644,11 +2780,11 @@ mod tests {
         let before = compactions();
 
         insert_rows(0, AUTHORITY_PRUNING_COMPACTION_THRESHOLD - 1);
-        prune_certificate_indexes(&storage, 2).unwrap();
+        prune_certificate_indexes(&storage, 2, false).unwrap();
         assert_eq!(compactions(), before);
 
         insert_rows(1_000, AUTHORITY_PRUNING_COMPACTION_THRESHOLD);
-        prune_certificate_indexes(&storage, 2).unwrap();
+        prune_certificate_indexes(&storage, 2, false).unwrap();
         assert_eq!(compactions(), before + 1);
         assert_eq!(storage.certificate_map().len_confirmed(), 0);
     }
@@ -2661,6 +2797,81 @@ mod tests {
         check_certificate_pass_compacts_at_least_threshold(
             BlockDB::<CurrentNetwork>::open(StorageMode::new_test(Some(temp_dir))).unwrap(),
         );
+    }
+
+    /// Runs startup pruning on a chain of `latest_height + 1` heights, each with one certificate row,
+    /// starting from `watermark`, and checks that only the rows of genesis and the retained heights
+    /// remain, that the map was rebuilt `expect_rebuilds` times, and that a rerun changes nothing.
+    #[cfg(feature = "prune-authority-data")]
+    fn check_startup_certificate_path<B: BlockStorage<CurrentNetwork>>(
+        storage: B,
+        latest_height: u32,
+        watermark: Option<u32>,
+        expect_rebuilds: usize,
+    ) {
+        fill_authorities(&storage, latest_height + 1);
+        // Spread the rows over the key space, so every rebuild slice holds some.
+        let certificate_id = |height: u32| Field::<CurrentNetwork>::from_u32(height * 256 + (height * 37) % 256);
+        for height in 0..=latest_height {
+            storage.certificate_map().insert(certificate_id(height), (height, 1)).unwrap();
+        }
+        if let Some(watermark) = watermark {
+            atomic_batch_scope!(storage, { storage.set_authority_pruned_below(watermark) }).unwrap();
+        }
+
+        let rebuilds = || CERTIFICATE_REBUILDS.with(|count| count.get());
+        let before = rebuilds();
+        prune_expired_authorities(&storage, latest_height).unwrap();
+        assert_eq!(rebuilds(), before + expect_rebuilds);
+
+        let floor = oldest_retained_authority_height(latest_height);
+        assert_eq!(storage.authority_pruned_below().unwrap(), Some(floor));
+        let retained: Vec<u32> = std::iter::once(0).chain(floor..=latest_height).collect();
+        assert_eq!(storage.certificate_map().len_confirmed(), retained.len());
+        for height in &retained {
+            assert_eq!(
+                storage.certificate_map().get_confirmed(&certificate_id(*height)).unwrap().as_deref(),
+                Some(&(*height, 1))
+            );
+        }
+
+        // A rerun has nothing to prune and leaves the map as it is.
+        prune_expired_authorities(&storage, latest_height).unwrap();
+        assert_eq!(rebuilds(), before + expect_rebuilds);
+        assert_eq!(storage.certificate_map().len_confirmed(), retained.len());
+    }
+
+    /// Ensures the first startup after enabling pruning, which prunes most heights, rebuilds the
+    /// certificate map with RocksDB storage.
+    #[cfg(all(feature = "prune-authority-data", feature = "rocks"))]
+    #[test]
+    fn test_startup_rebuilds_certificate_map_for_large_prune_rocksdb() {
+        let temp_dir = Arc::new(tempfile::tempdir().unwrap());
+        let storage = BlockDB::<CurrentNetwork>::open(StorageMode::new_test(Some(temp_dir))).unwrap();
+        // Prunes 200 of 300 heights, more than half.
+        let compactions = CERTIFICATE_COMPACTIONS.with(|count| count.get());
+        check_startup_certificate_path(storage, 3 * AUTHORITY_RETENTION_BLOCKS, None, 1);
+        assert_eq!(CERTIFICATE_COMPACTIONS.with(|count| count.get()), compactions + 1);
+    }
+
+    /// Ensures a routine startup, which prunes a few heights, deletes certificate rows one by one.
+    #[cfg(all(feature = "prune-authority-data", feature = "rocks"))]
+    #[test]
+    fn test_startup_deletes_certificate_rows_for_small_prune_rocksdb() {
+        let temp_dir = Arc::new(tempfile::tempdir().unwrap());
+        let storage = BlockDB::<CurrentNetwork>::open(StorageMode::new_test(Some(temp_dir))).unwrap();
+        // Prunes the 5 heights between the watermark and the floor.
+        let latest_height = 3 * AUTHORITY_RETENTION_BLOCKS;
+        let floor = oldest_retained_authority_height(latest_height);
+        check_startup_certificate_path(storage, latest_height, Some(floor - 5), 0);
+    }
+
+    /// Ensures in-memory storage, which has no range rewrite, deletes row by row after a large prune.
+    #[cfg(feature = "prune-authority-data")]
+    #[test]
+    fn test_startup_large_prune_without_range_rewrite() {
+        let storage = BlockMemory::<CurrentNetwork>::open(StorageMode::new_test(None)).unwrap();
+        check_startup_certificate_path(storage, 3 * AUTHORITY_RETENTION_BLOCKS, None, 0);
     }
 
     /// Ensures an interrupted startup resumes from the watermark with in-memory storage.
