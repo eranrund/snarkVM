@@ -223,7 +223,7 @@ const AUTHORITY_COMPACTION_INTERVAL_BLOCKS: u32 = if cfg!(test) { 8 } else { 20_
 /// can be logged and a shutdown can stop between them. Block hashes are uniform in their first
 /// bytes, so the slices split the first two key bytes evenly. Unit tests use a few slices.
 #[cfg(feature = "prune-authority-data")]
-const AUTHORITY_COMPACTION_SLICES: usize = if cfg!(test) { 4 } else { 256 };
+pub const AUTHORITY_COMPACTION_SLICES: usize = if cfg!(test) { 4 } else { 256 };
 
 /// The authority map compaction logs progress about this often.
 #[cfg(feature = "prune-authority-data")]
@@ -332,9 +332,9 @@ fn prune_authority_heights<N: Network, B: BlockStorage<N>>(storage: &B, heights:
 }
 
 /// Prunes, when opening storage, the authorities between the watermark and the retained window,
-/// then the certificate indexes of every pruned block.
+/// then the certificate indexes of every pruned block. Public for `examples/prune_bench.rs`.
 #[cfg(feature = "prune-authority-data")]
-fn prune_expired_authorities<N: Network, B: BlockStorage<N>>(storage: &B, latest_height: u32) -> Result<()> {
+pub fn prune_expired_authorities<N: Network, B: BlockStorage<N>>(storage: &B, latest_height: u32) -> Result<()> {
     let watermark = storage.authority_pruned_below()?;
     if let Some(below) = prune_authority_range(storage, watermark, oldest_retained_authority_height(latest_height))? {
         prune_certificate_indexes(storage, below)?;
@@ -408,9 +408,9 @@ fn prune_certificate_indexes<N: Network, B: BlockStorage<N>>(storage: &B, below:
 
 /// Compacts the authority map in [`AUTHORITY_COMPACTION_SLICES`] slices. Stops between slices once
 /// `stop` is set; a slice cut short by `BlockStorage::cancel_background_work` is redone by the next
-/// compaction, which every start runs.
+/// compaction, which every start runs. Public for `examples/prune_bench.rs`.
 #[cfg(feature = "prune-authority-data")]
-fn compact_authority_slices<N: Network, B: BlockStorage<N>>(storage: &B, stop: &AtomicBool) -> Result<()> {
+pub fn compact_authority_slices<N: Network, B: BlockStorage<N>>(storage: &B, stop: &AtomicBool) -> Result<()> {
     let total = AUTHORITY_COMPACTION_SLICES;
     info!("Compacting the authority map in {total} slices; this can take a while");
     let timer = std::time::Instant::now();

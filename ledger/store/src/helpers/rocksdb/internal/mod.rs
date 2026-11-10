@@ -222,6 +222,11 @@ impl Database for RocksDB {
             } else {
                 options.increase_parallelism(2);
                 options.set_max_background_jobs(4);
+                // A knob for `examples/prune_bench.rs`; the option cannot be changed after open.
+                #[cfg(feature = "prune-authority-data")]
+                if let Some(n) = std::env::var_os("SNARKVM_ROCKSDB_MAX_SUBCOMPACTIONS") {
+                    options.set_max_subcompactions(n.to_str().and_then(|n| n.parse().ok()).unwrap_or(1));
+                }
                 options.create_if_missing(true);
                 options.set_max_open_files(8192);
                 // Ticker statistics, without histograms or timers.

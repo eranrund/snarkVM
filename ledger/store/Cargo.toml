@@ -145,3 +145,17 @@ workspace = true
 
 [dev-dependencies.tracing]
 workspace = true
+
+[dev-dependencies.bincode]
+workspace = true
+
+[dev-dependencies.tracing-subscriber]
+version = "0.3"
+features = [ "env-filter" ]
+
+[target.'cfg(target_os = "macos")'.dev-dependencies.libc]
+version = "0.2"
+
+[[example]]
+name = "prune_bench"
+required-features = [ "rocks", "prune-authority-data" ]
