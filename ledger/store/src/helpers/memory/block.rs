@@ -220,9 +220,9 @@ impl<N: Network> BlockStorage<N> for BlockMemory<N> {
         &self.block_metadata_map
     }
 
-    /// Keeps only the certificate rows `retain` accepts.
+    /// Keeps only the certificate rows whose value `retain` accepts.
     #[cfg(feature = "prune-authority-data")]
-    fn retain_certificate_indexes(&self, retain: impl Fn(&Field<N>, &(u32, u64)) -> bool + Sync) -> Result<(usize, usize)> {
+    fn retain_certificate_indexes(&self, retain: impl Fn(&(u32, u64)) -> bool + Sync) -> Result<(usize, usize)> {
         self.certificate_map.retain_all(retain)
     }
 
