@@ -661,13 +661,13 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> DataMap<K
         Ok(<[u8; PREFIX_LEN]>::try_from(self.context.as_slice())?)
     }
 
-    /// Keeps only the rows `retain` accepts, rewriting the map in [`RETAIN_SLICES`] key-range slices
-    /// on [`RETAIN_THREADS`] threads, and returns the numbers of kept and removed rows. Each slice is
-    /// one write, so an interrupted run leaves every slice untouched or done, and a rerun changes
-    /// nothing. For maps whose keys are uniform in their first bytes, so the slices are even. Bypasses
-    /// the atomic batch: call it only when no batch is in progress.
+    /// Keeps only the rows whose value `retain` accepts, rewriting the map in [`RETAIN_SLICES`]
+    /// key-range slices on [`RETAIN_THREADS`] threads, and returns the numbers of kept and removed
+    /// rows. Each slice is one write, so an interrupted run leaves every slice untouched or done, and
+    /// a rerun changes nothing. Meant for maps whose keys are uniform in their first bytes, so the
+    /// slices are even. Bypasses the atomic batch, so it refuses to run while one is in progress.
     #[cfg(feature = "prune-authority-data")]
-    pub fn retain_all(&self, retain: impl Fn(&K, &V) -> bool + Sync) -> Result<(usize, usize)>
+    pub(crate) fn retain_all(&self, retain: impl Fn(&V) -> bool + Sync) -> Result<(usize, usize)>
     where
         K: Send + Sync,
         V: Send + Sync,
@@ -720,17 +720,17 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> DataMap<K
         Ok((progress.kept, progress.removed))
     }
 
-    /// Keeps only the rows `retain` accepts among those whose keys, after the map prefix, are in
-    /// `start..end` (`None`: the map's end), in one write: a range delete followed by puts of the kept
-    /// rows. Writes nothing if no row goes. Returns the numbers of kept and removed rows.
+    /// Keeps only the rows whose value `retain` accepts among those whose keys, after the map prefix,
+    /// are in `start..end` (`None`: the map's end), in one write: a range delete followed by puts of
+    /// the kept rows. Writes nothing if no row goes. Returns the numbers of kept and removed rows.
     #[cfg(feature = "prune-authority-data")]
     pub(crate) fn retain_range(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
-        mut retain: impl FnMut(&K, &V) -> bool,
+        mut retain: impl FnMut(&V) -> bool,
     ) -> Result<(usize, usize)> {
-        debug_assert!(!self.batch_in_progress.load(Ordering::SeqCst), "retain_range bypasses the atomic batch");
+        ensure!(!self.batch_in_progress.load(Ordering::SeqCst), "retain_range bypasses the atomic batch");
         let prefix = self.prefix()?;
         let lower = [&prefix[..], start].concat();
         // Any key under the prefix sorts below the prefix's successor, so the range stays in this map.
@@ -755,9 +755,7 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> DataMap<K
         batch.delete_range(&lower, &upper);
         let (mut kept, mut removed) = (0, 0);
         while let Some((key, value)) = iter.item() {
-            let k: K = unchecked_deserialize(&key[PREFIX_LEN..])?;
-            let v: V = unchecked_deserialize(value)?;
-            if retain(&k, &v) {
+            if retain(&unchecked_deserialize::<V>(value)?) {
                 batch.put(key, value);
                 kept += 1;
             } else {
@@ -1828,7 +1826,7 @@ mod tests {
         #[test]
         fn test_slice_keeps_retained_and_drops_the_rest() {
             let (map, neighbours) = setup(&ROWS);
-            let (kept, removed) = map.retain_range(&[0, 0], Some(&[0x80, 0]), |_, v| *v > 5).unwrap();
+            let (kept, removed) = map.retain_range(&[0, 0], Some(&[0x80, 0]), |v| *v > 5).unwrap();
             assert_eq!((kept, removed), (1, 2));
             // The slice `[0,0]..[0x80,0]` is half-open: `[0x80,0]` and above are untouched.
             assert_eq!(rows(&map), vec![([0, 1], 9), ([0x80, 0], 9), ([0x80, 1], 1), ([0xff, 0xff], 9)]);
@@ -1838,7 +1836,7 @@ mod tests {
         #[test]
         fn test_slice_to_the_map_end_covers_the_last_key() {
             let (map, neighbours) = setup(&ROWS);
-            let (kept, removed) = map.retain_range(&[0x80, 0], None, |_, v| *v > 5).unwrap();
+            let (kept, removed) = map.retain_range(&[0x80, 0], None, |v| *v > 5).unwrap();
             assert_eq!((kept, removed), (2, 1));
             assert_eq!(rows(&map), vec![
                 ([0, 0], 1),
@@ -1853,14 +1851,14 @@ mod tests {
         #[test]
         fn test_rerunning_a_slice_changes_nothing() {
             let (map, _) = setup(&ROWS);
-            map.retain_range(&[], None, |_, v| *v > 5).unwrap();
+            map.retain_range(&[], None, |v| *v > 5).unwrap();
             let after_first = rows(&map);
             assert_eq!(after_first.len(), 3);
-            let (kept, removed) = map.retain_range(&[], None, |_, v| *v > 5).unwrap();
+            let (kept, removed) = map.retain_range(&[], None, |v| *v > 5).unwrap();
             assert_eq!((kept, removed), (3, 0));
             assert_eq!(rows(&map), after_first);
             // An empty slice is a caller error, not a silent no-op.
-            assert!(map.retain_range(&[0x80, 0], Some(&[0x80, 0]), |_, _| true).is_err());
+            assert!(map.retain_range(&[0x80, 0], Some(&[0x80, 0]), |_| true).is_err());
         }
 
         /// `retain_all` covers every slice, including rows at the slice boundaries.
@@ -1869,11 +1867,11 @@ mod tests {
             let all: Vec<Row> = (0u16..16).map(|i| ((i * 0x1000).to_be_bytes(), u32::from(i % 2) * 9)).collect();
             let expected: Vec<Row> = all.iter().copied().filter(|(_, v)| *v > 5).collect();
             let (map, neighbours) = setup(&all);
-            assert_eq!(map.retain_all(|_, v| *v > 5).unwrap(), (8, 8));
+            assert_eq!(map.retain_all(|v| *v > 5).unwrap(), (8, 8));
             assert_eq!(rows(&map), expected);
             assert_neighbours_intact(&map, &neighbours);
             // A rerun finds nothing to remove.
-            assert_eq!(map.retain_all(|_, v| *v > 5).unwrap(), (8, 0));
+            assert_eq!(map.retain_all(|v| *v > 5).unwrap(), (8, 0));
             assert_eq!(rows(&map), expected);
         }
 
@@ -1881,7 +1879,7 @@ mod tests {
         fn test_slice_boundaries_use_the_key_bytes() {
             let (map, _) = setup(&ROWS);
             // Everything in the first half goes; the second half is not read.
-            let (kept, removed) = map.retain_range(&[], Some(&[0x80]), |_, _| false).unwrap();
+            let (kept, removed) = map.retain_range(&[], Some(&[0x80]), |_| false).unwrap();
             assert_eq!((kept, removed), (0, 3));
             assert_eq!(rows(&map), vec![([0x80, 0], 9), ([0x80, 1], 1), ([0xff, 0xff], 9)]);
         }
