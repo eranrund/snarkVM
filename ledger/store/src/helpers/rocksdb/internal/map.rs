@@ -635,17 +635,20 @@ impl<'a, V: 'a + Clone + Serialize + DeserializeOwned> Iterator for Values<'a, V
 impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> DataMap<K, V> {
     /// Compacts this map's keys. See `RocksDB::compact_prefix`.
     pub fn compact(&self) -> Result<()> {
-        let prefix = <[u8; PREFIX_LEN]>::try_from(self.context.as_slice())?;
-        self.database.compact_prefix(prefix)
+        self.database.compact_prefix(self.prefix()?)
+    }
+
+    /// This map's key prefix.
+    fn prefix(&self) -> Result<[u8; PREFIX_LEN]> {
+        Ok(<[u8; PREFIX_LEN]>::try_from(self.context.as_slice())?)
     }
 
     /// Rewrites the rows whose keys, after the map prefix, are in `start..end` (`None`: the map's
     /// end), keeping only the rows `retain` accepts. The slice is one write, a range delete followed
-    /// by puts of the kept rows, so an interrupted run leaves every slice either untouched or done,
-    /// and redoing a finished slice changes nothing. The kept rows are held in memory meanwhile.
-    /// Bypasses the atomic batch: call it only when no batch is in progress. `readahead` is the
-    /// iterator's readahead size in bytes, 0 for RocksDB's default. Returns the numbers of kept and
-    /// removed rows.
+    /// by puts of the kept rows, buffered in memory, so an interrupted run leaves every slice either
+    /// untouched or done, and redoing a finished slice changes nothing. Bypasses the atomic batch:
+    /// call it only when no batch is in progress. `readahead` is the iterator's readahead size in
+    /// bytes, 0 for RocksDB's default. Returns the numbers of kept and removed rows.
     #[cfg(feature = "prune-authority-data")]
     pub fn retain_range(
         &self,
@@ -655,7 +658,7 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> DataMap<K
         mut retain: impl FnMut(&K, &V) -> bool,
     ) -> Result<(usize, usize)> {
         debug_assert!(!self.batch_in_progress.load(Ordering::SeqCst), "retain_range bypasses the atomic batch");
-        let prefix = <[u8; PREFIX_LEN]>::try_from(self.context.as_slice())?;
+        let prefix = self.prefix()?;
         let lower = [&prefix[..], start].concat();
         // Any key under the prefix sorts below the prefix's successor, so the range stays in this map.
         let upper = match end {
@@ -673,27 +676,24 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> DataMap<K
         }
         let mut iter = self.database.raw_iterator_opt(options);
         iter.seek(&lower);
-        let mut kept = Vec::new();
-        let mut removed = 0;
+        // The range delete applies before the puts that follow it.
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete_range(&lower, &upper);
+        let (mut kept, mut removed) = (0, 0);
         while let Some((key, value)) = iter.item() {
             let k: K = unchecked_deserialize(&key[PREFIX_LEN..])?;
             let v: V = unchecked_deserialize(value)?;
             if retain(&k, &v) {
-                kept.push((key.to_vec(), value.to_vec()));
+                batch.put(key, value);
+                kept += 1;
             } else {
                 removed += 1;
             }
             iter.next();
         }
         iter.status()?;
-
-        let mut batch = rocksdb::WriteBatch::default();
-        batch.delete_range(&lower, &upper);
-        for (key, value) in &kept {
-            batch.put(key, value);
-        }
         self.database.write(batch)?;
-        Ok((kept.len(), removed))
+        Ok((kept, removed))
     }
 
     #[inline]
@@ -1740,6 +1740,12 @@ mod tests {
             map.iter_confirmed().map(|(k, v)| (*k, *v)).collect()
         }
 
+        fn assert_neighbours_intact(map: &DataMap<[u8; 2], u32>, neighbours: &[Vec<u8>]) {
+            for key in neighbours {
+                assert_eq!(map.database.get(key).unwrap().as_deref(), Some(&b"n"[..]), "{key:?}");
+            }
+        }
+
         const ROWS: [Row; 6] =
             [([0, 0], 1), ([0, 1], 9), ([0x7f, 0xff], 1), ([0x80, 0], 9), ([0x80, 1], 1), ([0xff, 0xff], 9)];
 
@@ -1750,9 +1756,7 @@ mod tests {
             assert_eq!((kept, removed), (1, 2));
             // The slice `[0,0]..[0x80,0]` is half-open: `[0x80,0]` and above are untouched.
             assert_eq!(rows(&map), vec![([0, 1], 9), ([0x80, 0], 9), ([0x80, 1], 1), ([0xff, 0xff], 9)]);
-            for key in &neighbours {
-                assert_eq!(map.database.get(key).unwrap().as_deref(), Some(&b"n"[..]), "{key:?}");
-            }
+            assert_neighbours_intact(&map, &neighbours);
         }
 
         #[test]
@@ -1767,9 +1771,7 @@ mod tests {
                 ([0x80, 0], 9),
                 ([0xff, 0xff], 9)
             ]);
-            for key in &neighbours {
-                assert_eq!(map.database.get(key).unwrap().as_deref(), Some(&b"n"[..]), "{key:?}");
-            }
+            assert_neighbours_intact(&map, &neighbours);
         }
 
         #[test]
