@@ -54,14 +54,11 @@ Commands (all take the database directory first):
   scan <db_dir> [--raw]        Iterates the certificate map and counts the rows a pass would remove,
                                decoding keys and values as the store does. --raw decodes only the
                                height from the raw value bytes.
-  prune <db_dir>               The production pass (`prune_expired_authorities`). Its log lines
-                               give the scan+delete time and the compaction time separately.
+  prune <db_dir>               The production pass (`prune_expired_authorities`): the sliced rebuild of
+                               the certificate map, then compaction. Its log lines give both times.
   prune-parallel <db_dir> <threads> [--no-compact]
                                One forward iterator and direct point deletes per key-range thread,
                                then one compaction.
-  rebuild <db_dir> [slices] [--threads N] [--no-compact]
-                               Rewrites the map in key-range slices (default 256), each one range
-                               delete plus puts of the kept rows, then one compaction.
   compact-certs <db_dir>       Compacts the certificate map's key range.
   restart <db_dir>             The production pass again, when there is nothing left to remove.
 
@@ -90,8 +87,7 @@ Variants, each on a fresh copy of the dataset:
   $BIN prune /data/certs;                                $BIN restart /data/certs
   $BIN prune-parallel /data/certs 1 --readahead 2097152; $BIN restart /data/certs
   $BIN prune-parallel /data/certs 8;                     $BIN restart /data/certs
-  $BIN rebuild /data/certs --readahead 2097152;          $BIN restart /data/certs
-  $BIN rebuild /data/certs --threads 8 --subcompactions 8; $BIN restart /data/certs
+  $BIN prune /data/certs --subcompactions 8;             $BIN restart /data/certs
 Restart cost before compaction: run a variant with --no-compact, then restart, then compact-certs
 (optionally --subcompactions 8), then restart again.
 ";
@@ -453,50 +449,6 @@ fn prune_parallel(bench: &Bench, threads: usize, compact: bool) -> Result<()> {
     if compact { bench.compact() } else { Ok(()) }
 }
 
-fn rebuild(bench: &Bench, slices: usize, threads: usize, compact: bool) -> Result<()> {
-    ensure!((1..=65536).contains(&slices), "slices must be in 1..=65536");
-    let below = bench.watermark()?;
-    let (kept, removed, next) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
-    bench.timed(&format!("rebuild {slices} slices x{threads} threads"), || {
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads)
-                .map(|_| {
-                    let (kept, removed, next) = (&kept, &removed, &next);
-                    scope.spawn(move || -> Result<()> {
-                        loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            if i >= slices {
-                                return Ok(());
-                            }
-                            let t = Instant::now();
-                            let start = slice_start(i, slices).expect("slice below count");
-                            let end = slice_start(i + 1, slices);
-                            let (k, r) = bench.storage.certificate_map().retain_range(
-                                &start,
-                                end.as_ref().map(|e| &e[..]),
-                                bench.readahead,
-                                |_, (height, _)| !is_pruned_height(below, *height),
-                            )?;
-                            if slices <= 64 || i.is_multiple_of(slices / 16) {
-                                println!("slice {i}: kept {k}, removed {r}, {:.1} s", t.elapsed().as_secs_f64());
-                            }
-                            kept.fetch_add(k, Ordering::Relaxed);
-                            removed.fetch_add(r, Ordering::Relaxed);
-                        }
-                    })
-                })
-                .collect();
-            for worker in workers {
-                worker.join().map_err(|_| anyhow!("worker thread panicked"))??;
-            }
-            Ok(())
-        })
-    })?;
-    let (kept, removed) = (kept.load(Ordering::Relaxed), removed.load(Ordering::Relaxed));
-    println!("scanned {} rows, kept {kept}, removed {removed}", kept + removed);
-    if compact { bench.compact() } else { Ok(()) }
-}
-
 fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
@@ -538,13 +490,6 @@ fn main() -> Result<()> {
         "scan" => scan(&bench, flag(&args, "--raw"))?,
         "prune" | "restart" => prune(&bench)?,
         "prune-parallel" => prune_parallel(&bench, arg(2)?.parse()?, !flag(&args, "--no-compact"))?,
-        "rebuild" => {
-            let slices = match args.get(2).filter(|a| !a.starts_with("--")) {
-                Some(slices) => slices.parse()?,
-                None => 256,
-            };
-            rebuild(&bench, slices, flag_value(&args, "--threads")?.unwrap_or(1), !flag(&args, "--no-compact"))?
-        }
         "compact-certs" => bench.compact()?,
         other => bail!("unknown command {other}; see --help"),
     }

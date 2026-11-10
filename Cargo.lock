@@ -3737,6 +3737,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "indexmap 2.14.0",
+ "libc",
  "locktick",
  "parking_lot",
  "rayon",
@@ -3757,6 +3758,7 @@ dependencies = [
  "snarkvm-utilities",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
  "tracing-test",
 ]
 
