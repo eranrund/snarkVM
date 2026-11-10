@@ -230,21 +230,10 @@ impl<N: Network> BlockStorage<N> for BlockDB<N> {
         self.certificate_map.compact()
     }
 
+    /// Keeps only the certificate rows `retain` accepts. See `DataMap::retain_all`.
     #[cfg(feature = "prune-authority-data")]
-    fn has_certificate_range_rewrite(&self) -> bool {
-        true
-    }
-
-    /// Rewrites one key-range slice of the certificate map. See `DataMap::retain_range`.
-    #[cfg(feature = "prune-authority-data")]
-    fn retain_certificate_range(
-        &self,
-        start: &[u8],
-        end: Option<&[u8]>,
-        readahead: usize,
-        retain: impl FnMut(&Field<N>, &(u32, u64)) -> bool,
-    ) -> Result<(usize, usize)> {
-        self.certificate_map.retain_range(start, end, readahead, retain)
+    fn retain_certificate_indexes(&self, retain: impl Fn(&Field<N>, &(u32, u64)) -> bool + Sync) -> Result<(usize, usize)> {
+        self.certificate_map.retain_all(retain)
     }
 
     /// Returns the block metadata map.
