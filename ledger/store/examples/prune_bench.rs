@@ -23,9 +23,13 @@ use snarkvm_console::{
     prelude::FromBytes,
     types::Field,
 };
+use snarkvm_ledger_authority::Authority;
+use snarkvm_ledger_block::Block;
 use snarkvm_ledger_store::{
+    AUTHORITY_COMPACTION_SLICES,
     AUTHORITY_RETENTION_BLOCKS,
     BlockStorage,
+    compact_authority_slices,
     helpers::rocksdb::{BlockDB, BlockMap, Database, MapID, PREFIX_LEN, RocksDB},
     oldest_retained_authority_height,
     prune_expired_authorities,
@@ -34,7 +38,7 @@ use snarkvm_utilities::bytes::unchecked_deserialize;
 use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Instant,
 };
 
@@ -49,13 +53,31 @@ Commands (all take the database directory first):
         order, with random keys. Sets the authority-pruning watermark to the retained window, so the
         authority walk is a no-op, and waits for compaction to settle. Resumable: rerun the same
         command after an interruption.
+  sample <bundle_dir> <out_file> [min_height]
+        Decodes CDN block bundles (*.blocks), prints size distributions, and saves the authority bytes
+        and certificate counts of the blocks at or above <min_height> (default 22000000) for `build`.
+  build <db_dir> <sample_file> <heights> [old_sample_file] [split]
+        Writes id, reverse-id, authority and certificate rows for every height in 0..<heights> from the
+        sampled authorities (heights below <split> use <old_sample_file>), then waits for compaction
+        to settle. No watermark is set, so `prune <db_dir> <heights - 1>` is a first enable with
+        authority data to walk and compact.
+  compact-authorities <db_dir> [--stop-after <n>]
+                               Runs the production authority map compaction synchronously and prints
+                               wall time, disk bytes, and the ledger directory size before and after.
+                               --stop-after compacts only the first <n> slices, as a node shutdown
+                               between slices leaves them; the next run compacts all slices again
+                               and RocksDB skips the finished ones.
   settle <db_dir>              Flushes and waits for background compaction to finish.
   status <db_dir>              Prints the watermark and level layout.
   scan <db_dir> [--raw]        Iterates the certificate map and counts the rows a pass would remove,
                                decoding keys and values as the store does. --raw decodes only the
                                height from the raw value bytes.
-  prune <db_dir>               The production pass (`prune_expired_authorities`): the sliced rebuild of
-                               the certificate map, then compaction. Its log lines give both times.
+  prune <db_dir> [latest_height]
+                               The production pass (`prune_expired_authorities`): the authority walk,
+                               then the sliced rebuild of the certificate map and its compaction. Its
+                               log lines give each time. <latest_height> defaults to the watermark plus
+                               the retention window. A node then starts the background authority
+                               compaction; the bench does not, time it with compact-authorities.
   prune-parallel <db_dir> <threads> [--no-compact]
                                One forward iterator and direct point deletes per key-range thread,
                                then one compaction.
@@ -217,7 +239,7 @@ fn print_props(db: &RocksDB, label: &str, full: bool) {
 struct Bench {
     storage: BlockDB<N>,
     db: RocksDB,
-    log: PathBuf,
+    ledger_dir: PathBuf,
     readahead: usize,
 }
 
@@ -233,7 +255,11 @@ impl Bench {
         let storage = BlockDB::<N>::open(mode.clone())?;
         let db = RocksDB::open(N::ID, mode.clone())?;
         println!("opened {db_dir} in {:.2} s", t.elapsed().as_secs_f64());
-        Ok(Self { storage, db, log: aleo_std_storage::aleo_ledger_dir(N::ID, &mode).join("LOG"), readahead })
+        Ok(Self { storage, db, ledger_dir: aleo_std_storage::aleo_ledger_dir(N::ID, &mode), readahead })
+    }
+
+    fn log(&self) -> PathBuf {
+        self.ledger_dir.join("LOG")
     }
 
     fn watermark(&self) -> Result<u32> {
@@ -247,9 +273,9 @@ impl Bench {
     /// Runs `f`, printing wall time, disk bytes, write stalls and RocksDB state around it.
     fn timed<T>(&self, label: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         print_props(&self.db, &format!("before {label}"), false);
-        let (io0, stalls0, t) = (disk_io(), stall_count(&self.log), Instant::now());
+        let (io0, stalls0, t) = (disk_io(), stall_count(&self.log()), Instant::now());
         let out = f()?;
-        let (secs, io1, stalls1) = (t.elapsed().as_secs_f64(), disk_io(), stall_count(&self.log));
+        let (secs, io1, stalls1) = (t.elapsed().as_secs_f64(), disk_io(), stall_count(&self.log()));
         println!(
             "=== {label}: {secs:.1} s, disk read {:.2} GB, disk write {:.2} GB, write stalls {}",
             gb(io1.read - io0.read),
@@ -398,11 +424,171 @@ fn scan(bench: &Bench, raw: bool) -> Result<()> {
     Ok(())
 }
 
-/// The production path. `prune_expired_authorities` logs the scan+delete and compaction times.
-fn prune(bench: &Bench) -> Result<()> {
-    let below = bench.watermark()?;
-    let latest_height = below + AUTHORITY_RETENTION_BLOCKS - 1;
-    bench.timed("prune (production path)", || prune_expired_authorities(&bench.storage, latest_height))
+/// The production path. `prune_expired_authorities` logs the authority walk, the certificate rebuild
+/// and its compaction separately.
+fn prune(bench: &Bench, latest_height: Option<u32>) -> Result<()> {
+    let latest_height = match latest_height {
+        Some(latest_height) => latest_height,
+        None => bench.watermark()? + AUTHORITY_RETENTION_BLOCKS - 1,
+    };
+    bench.timed("prune (production path)", || prune_expired_authorities(&bench.storage, latest_height))?;
+    println!("a node now compacts the authority map in the background; time it with compact-authorities");
+    Ok(())
+}
+
+/// The production authority map compaction, with the ledger directory size around it. With
+/// `stop_after`, only that many slices, as a shutdown between slices leaves them.
+fn compact_authorities(bench: &Bench, stop_after: Option<usize>) -> Result<()> {
+    let before = dir_size(&bench.ledger_dir)?;
+    println!("ledger directory: {:.2} GB", gb(before));
+    bench.timed("authority map compaction", || match stop_after {
+        None => compact_authority_slices(&bench.storage, &AtomicBool::new(false)),
+        Some(n) => {
+            for i in 0..n.min(AUTHORITY_COMPACTION_SLICES) {
+                bench.storage.compact_authority_slice(i, AUTHORITY_COMPACTION_SLICES)?;
+            }
+            println!("stopped after {n} of {AUTHORITY_COMPACTION_SLICES} slices");
+            Ok(())
+        }
+    })?;
+    let after = dir_size(&bench.ledger_dir)?;
+    println!("ledger directory: {:.2} GB -> {:.2} GB ({:+.2} GB)", gb(before), gb(after), gb(after) - gb(before));
+    Ok(())
+}
+
+/// The apparent size of every file under `dir`, like `du -sb`.
+fn dir_size(dir: &Path) -> Result<u64> {
+    let mut total = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        total += if metadata.is_dir() { dir_size(&entry.path())? } else { metadata.len() };
+    }
+    Ok(total)
+}
+
+fn percentiles(mut values: Vec<u64>) -> String {
+    if values.is_empty() {
+        return "n=0".into();
+    }
+    values.sort_unstable();
+    let at = |p: f64| values[((values.len() - 1) as f64 * p) as usize];
+    let mean = values.iter().sum::<u64>() as f64 / values.len() as f64;
+    format!(
+        "n={} mean={mean:.0} p50={} p90={} p99={} max={}",
+        values.len(),
+        at(0.5),
+        at(0.9),
+        at(0.99),
+        values[values.len() - 1]
+    )
+}
+
+/// Decodes the CDN bundles in `dir`, prints size distributions, and saves the authority bytes and
+/// certificate counts of blocks at or above `min_height` to `out`.
+fn sample(dir: &str, out: &str, min_height: u32) -> Result<()> {
+    let mut bundles: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "blocks"))
+        .collect();
+    bundles.sort();
+    let (mut recent_authority, mut recent_certs, mut recent_block) = (vec![], vec![], vec![]);
+    let mut saved: Vec<(Vec<u8>, u32)> = vec![];
+    for path in bundles {
+        let blocks: Vec<Block<N>> = unchecked_deserialize(&std::fs::read(&path)?)?;
+        let recent = blocks.first().is_some_and(|b| b.height() >= min_height);
+        let (mut authority, mut certs, mut block) = (vec![], vec![], vec![]);
+        for b in &blocks {
+            let authority_bytes = bincode::serialize(b.authority())?;
+            let cert_count = match b.authority() {
+                Authority::Beacon(_) => 0,
+                Authority::Quorum(subdag) => u32::try_from(subdag.certificate_ids().count())?,
+            };
+            authority.push(authority_bytes.len() as u64);
+            certs.push(u64::from(cert_count));
+            block.push(bincode::serialize(b)?.len() as u64);
+            if recent {
+                saved.push((authority_bytes, cert_count));
+            }
+        }
+        if recent {
+            recent_authority.extend(authority);
+            recent_certs.extend(certs);
+            recent_block.extend(block);
+        } else {
+            println!("{}: height {}", path.display(), blocks.first().map_or(0, Block::height));
+            println!("  authority bytes {}", percentiles(authority));
+            println!("  certificates    {}", percentiles(certs));
+            println!("  block bytes     {}", percentiles(block));
+        }
+    }
+    println!("saved (>= {min_height}): {} blocks", saved.len());
+    println!("  authority bytes {}", percentiles(recent_authority));
+    println!("  certificates    {}", percentiles(recent_certs));
+    println!("  block bytes     {}", percentiles(recent_block));
+    std::fs::write(out, bincode::serialize(&saved)?)?;
+    Ok(())
+}
+
+fn raw_key<K: serde::Serialize>(map: BlockMap, key: &K) -> Result<Vec<u8>> {
+    let mut raw = Vec::with_capacity(PREFIX_LEN + 32);
+    raw.extend_from_slice(&N::ID.to_le_bytes());
+    raw.extend_from_slice(&u16::from(MapID::Block(map)).to_le_bytes());
+    bincode::serialize_into(&mut raw, key)?;
+    Ok(raw)
+}
+
+/// Writes id, reverse-id, authority and certificate rows for `0..heights` from sampled authorities.
+/// Heights below `split` take their samples from `old_sample_file`.
+fn build(bench: &Bench, sample_file: &str, heights: u32, old_sample_file: Option<&str>, split: u32) -> Result<()> {
+    let recent: Vec<(Vec<u8>, u32)> = bincode::deserialize(&std::fs::read(sample_file)?)?;
+    let old: Vec<(Vec<u8>, u32)> = match old_sample_file {
+        Some(file) => bincode::deserialize(&std::fs::read(file)?)?,
+        None => recent.clone(),
+    };
+    ensure!(!recent.is_empty() && !old.is_empty(), "empty sample file");
+    let db = bench.raw_db();
+    let mut write_options = rocksdb::WriteOptions::default();
+    write_options.disable_wal(true);
+    let mut rng = SplitMix(7);
+    let mut bytes = [0u8; 32];
+    let mut batch = rocksdb::WriteBatch::default();
+    let (t, mut authority_bytes, mut certs) = (Instant::now(), 0u64, 0u64);
+    for height in 0..heights {
+        random_key(&mut rng, &mut bytes);
+        let hash: <N as Network>::BlockHash = Field::<N>::from_bytes_le(&bytes)?.into();
+        let samples = if height < split { &old } else { &recent };
+        let (authority, cert_count) = &samples[height as usize % samples.len()];
+        batch.put(raw_key(BlockMap::ID, &height)?, bincode::serialize(&hash)?);
+        batch.put(raw_key(BlockMap::ReverseID, &hash)?, bincode::serialize(&height)?);
+        batch.put(raw_key(BlockMap::Authority, &hash)?, authority);
+        authority_bytes += authority.len() as u64;
+        if height > 0 {
+            for i in 0..*cert_count {
+                random_key(&mut rng, &mut bytes);
+                let id = Field::<N>::from_bytes_le(&bytes)?;
+                let index = (height, u64::from(height) * 2 + u64::from(i % 2));
+                batch.put(raw_key(BlockMap::Certificate, &id)?, bincode::serialize(&index)?);
+                certs += 1;
+            }
+        }
+        if batch.size_in_bytes() > 256 << 20 {
+            db.write_opt(std::mem::take(&mut batch), &write_options)?;
+        }
+        if height.is_multiple_of(100_000) {
+            println!("height {height}: {:.1} GB authority, {:.0} s", gb(authority_bytes), t.elapsed().as_secs_f64());
+        }
+    }
+    db.write_opt(batch, &write_options)?;
+    db.flush()?;
+    println!(
+        "built {heights} heights, {certs} certificate rows, {:.1} GB authority in {:.0} s; next: prune <db_dir> {}",
+        gb(authority_bytes),
+        t.elapsed().as_secs_f64(),
+        heights - 1
+    );
+    bench.settle()
 }
 
 fn prune_parallel(bench: &Bench, threads: usize, compact: bool) -> Result<()> {
@@ -475,11 +661,18 @@ fn main() -> Result<()> {
         print!("{HELP}");
         return Ok(());
     }
+    if command == "sample" {
+        return sample(arg(1)?, arg(2)?, args.get(3).map_or(Ok(22_000_000), |a| a.parse())?);
+    }
     let db_dir = arg(1)?;
     let bench =
         Bench::open(db_dir, flag_value(&args, "--readahead")?.unwrap_or(0), flag_value(&args, "--subcompactions")?)?;
     if command == "build-index" {
         return build_index(&bench, db_dir, arg(2)?.parse()?, arg(3)?.parse()?, arg(4)?.parse()?);
+    }
+    if command == "build" {
+        let split = args.get(5).map_or(Ok(0), |a| a.parse())?;
+        return build(&bench, arg(2)?, arg(3)?.parse()?, args.get(4).map(String::as_str), split);
     }
     print_props(&bench.db, "at open", true);
     match command.as_str() {
@@ -488,7 +681,10 @@ fn main() -> Result<()> {
             println!("watermark = {:?}", bench.storage.authority_pruned_below()?);
         }
         "scan" => scan(&bench, flag(&args, "--raw"))?,
-        "prune" | "restart" => prune(&bench)?,
+        "prune" | "restart" => {
+            prune(&bench, args.get(2).filter(|a| !a.starts_with("--")).map(|a| a.parse()).transpose()?)?
+        }
+        "compact-authorities" => compact_authorities(&bench, flag_value(&args, "--stop-after")?)?,
         "prune-parallel" => prune_parallel(&bench, arg(2)?.parse()?, !flag(&args, "--no-compact"))?,
         "compact-certs" => bench.compact()?,
         other => bail!("unknown command {other}; see --help"),
