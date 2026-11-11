@@ -26,7 +26,6 @@ use snarkvm_console::{
 use snarkvm_ledger_authority::Authority;
 use snarkvm_ledger_block::Block;
 use snarkvm_ledger_store::{
-    AUTHORITY_COMPACTION_SLICES,
     AUTHORITY_RETENTION_BLOCKS,
     BlockStorage,
     compact_authority_slices,
@@ -444,10 +443,11 @@ fn compact_authorities(bench: &Bench, stop_after: Option<usize>) -> Result<()> {
     bench.timed("authority map compaction", || match stop_after {
         None => compact_authority_slices(&bench.storage, &AtomicBool::new(false)),
         Some(n) => {
-            for i in 0..n.min(AUTHORITY_COMPACTION_SLICES) {
-                bench.storage.compact_authority_slice(i, AUTHORITY_COMPACTION_SLICES)?;
+            let slices = bench.storage.authority_compaction_slices();
+            for i in 0..n.min(slices) {
+                bench.storage.compact_authority_slice(i, slices)?;
             }
-            println!("stopped after {n} of {AUTHORITY_COMPACTION_SLICES} slices");
+            println!("stopped after {n} of {slices} slices");
             Ok(())
         }
     })?;
