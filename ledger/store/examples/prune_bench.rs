@@ -28,7 +28,6 @@ use snarkvm_ledger_block::Block;
 use snarkvm_ledger_store::{
     AUTHORITY_RETENTION_BLOCKS,
     BlockStorage,
-    compact_authority_slices,
     helpers::rocksdb::{BlockDB, BlockMap, Database, MapID, PREFIX_LEN, RocksDB},
     oldest_retained_authority_height,
     prune_expired_authorities,
@@ -37,7 +36,7 @@ use snarkvm_utilities::bytes::unchecked_deserialize;
 use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
     time::Instant,
 };
 
@@ -61,11 +60,12 @@ Commands (all take the database directory first):
         to settle. No watermark is set, so `prune <db_dir> <heights - 1>` is a first enable with
         authority data to walk and compact.
   compact-authorities <db_dir> [--stop-after <n>]
-                               Runs the production authority map compaction synchronously and prints
-                               wall time, disk bytes, and the ledger directory size before and after.
-                               --stop-after compacts only the first <n> slices, as a node shutdown
-                               between slices leaves them; the next run compacts all slices again
-                               and RocksDB skips the finished ones.
+                               Compacts the authority map slice by slice as a node does (the slice
+                               count comes from the map's live files), and prints wall time, disk
+                               bytes, and the ledger directory size before and after. --stop-after
+                               compacts only the first <n> slices, as a node shutdown between slices
+                               leaves them; the next run compacts all slices again and RocksDB skips
+                               the finished ones.
   settle <db_dir>              Flushes and waits for background compaction to finish.
   status <db_dir>              Prints the watermark and level layout.
   scan <db_dir> [--raw]        Iterates the certificate map and counts the rows a pass would remove,
@@ -435,21 +435,22 @@ fn prune(bench: &Bench, latest_height: Option<u32>) -> Result<()> {
     Ok(())
 }
 
-/// The production authority map compaction, with the ledger directory size around it. With
-/// `stop_after`, only that many slices, as a shutdown between slices leaves them.
+/// The authority map compaction as a node runs it, slice by slice, with the ledger directory size
+/// around it. With `stop_after`, only that many slices, as a shutdown between slices leaves them.
 fn compact_authorities(bench: &Bench, stop_after: Option<usize>) -> Result<()> {
     let before = dir_size(&bench.ledger_dir)?;
     println!("ledger directory: {:.2} GB", gb(before));
-    bench.timed("authority map compaction", || match stop_after {
-        None => compact_authority_slices(&bench.storage, &AtomicBool::new(false)),
-        Some(n) => {
-            let slices = bench.storage.authority_compaction_slices();
-            for i in 0..n.min(slices) {
-                bench.storage.compact_authority_slice(i, slices)?;
+    let slices = bench.storage.authority_compaction_slices();
+    let count = stop_after.map_or(slices, |n| n.min(slices));
+    bench.timed(&format!("authority map compaction, {count} of {slices} slices"), || {
+        let t = Instant::now();
+        for i in 0..count {
+            bench.storage.compact_authority_slice(i, slices)?;
+            if (i + 1).is_multiple_of(16) || i + 1 == count {
+                println!("compacted {} of {slices} slices, {:.0} s", i + 1, t.elapsed().as_secs_f64());
             }
-            println!("stopped after {n} of {slices} slices");
-            Ok(())
         }
+        Ok(())
     })?;
     let after = dir_size(&bench.ledger_dir)?;
     println!("ledger directory: {:.2} GB -> {:.2} GB ({:+.2} GB)", gb(before), gb(after), gb(after) - gb(before));
