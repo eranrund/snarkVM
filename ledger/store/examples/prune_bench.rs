@@ -60,9 +60,10 @@ Commands (all take the database directory first):
         to settle. No watermark is set, so `prune <db_dir> <heights - 1>` is a first enable with
         authority data to walk and compact.
   compact-authorities <db_dir> [--stop-after <n>]
-                               Compacts the authority map slice by slice as a node does (the slice
-                               count comes from the map's live files), and prints wall time, disk
-                               bytes, and the ledger directory size before and after. --stop-after
+                               Compacts the authority map slice by slice as a node does (the slices
+                               come from the map's live files; those without deletions are skipped),
+                               and prints wall time, disk bytes, and the ledger directory size before
+                               and after. --stop-after
                                compacts only the first <n> slices, as a node shutdown between slices
                                leaves them; the next run compacts all slices again and RocksDB skips
                                the finished ones.
@@ -440,14 +441,18 @@ fn prune(bench: &Bench, latest_height: Option<u32>) -> Result<()> {
 fn compact_authorities(bench: &Bench, stop_after: Option<usize>) -> Result<()> {
     let before = dir_size(&bench.ledger_dir)?;
     println!("ledger directory: {:.2} GB", gb(before));
-    let slices = bench.storage.authority_compaction_slices();
+    let plan = bench.storage.authority_compaction_plan()?;
+    let slices = plan.len();
     let count = stop_after.map_or(slices, |n| n.min(slices));
+    println!("{slices} slices, {} with deletions to reclaim", plan.iter().filter(|&&compact| compact).count());
     bench.timed(&format!("authority map compaction, {count} of {slices} slices"), || {
         let t = Instant::now();
-        for i in 0..count {
-            bench.storage.compact_authority_slice(i, slices)?;
+        for (i, &compact) in plan.iter().enumerate().take(count) {
+            if compact {
+                bench.storage.compact_authority_slice(i, slices)?;
+            }
             if (i + 1).is_multiple_of(16) || i + 1 == count {
-                println!("compacted {} of {slices} slices, {:.0} s", i + 1, t.elapsed().as_secs_f64());
+                println!("passed {} of {slices} slices, {:.0} s", i + 1, t.elapsed().as_secs_f64());
             }
         }
         Ok(())
